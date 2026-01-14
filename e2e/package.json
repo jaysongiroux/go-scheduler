@@ -17,6 +17,7 @@
     "vitest": "^4.0.16"
   },
   "dependencies": {
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "go-scheduler-node-sdk": "file:../clients/node"
   }
 }

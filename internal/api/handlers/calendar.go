@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jaysongiroux/go-scheduler/internal/api/web"
 	"github.com/jaysongiroux/go-scheduler/internal/db/services/calendar"
+	"github.com/jaysongiroux/go-scheduler/internal/db/services/calendar_member"
 	"github.com/jaysongiroux/go-scheduler/internal/logger"
 	"github.com/jaysongiroux/go-scheduler/internal/workers"
 )
@@ -34,21 +35,14 @@ func (h *Handler) CreateCalendar(w http.ResponseWriter, r *http.Request) {
 	cal.CreatedTs = now
 	cal.UpdatedTs = now
 
-	exists, err := h.AccountRepo.CheckAccountExists(r.Context(), cal.AccountID)
-	if err != nil {
-		logger.Error("Failed to check account exists: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to check account exists", err.Error())
-		return
-	}
-	if !exists {
-		logger.Error("Account does not exist: %v", cal.AccountID)
-		web.RespondError(w, http.StatusNotFound, "Account does not exist", err.Error())
-		return
-	}
-
 	if err := h.CalendarRepo.CreateCalendar(r.Context(), &cal); err != nil {
 		logger.Error("Failed to create calendar: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to create calendar", err.Error())
+		web.RespondError(
+			w,
+			http.StatusInternalServerError,
+			"Failed to create calendar",
+			err.Error(),
+		)
 		return
 	}
 
@@ -80,39 +74,116 @@ func (h *Handler) GetCalendar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	web.RespondJSON(w, http.StatusOK, cal)
+	// Get members for this calendar
+	members, err := h.CalendarMemberRepo.GetCalendarMembers(r.Context(), calendarUID)
+	if err != nil {
+		logger.Error("Failed to get calendar members: %v", err)
+		// Don't fail the request, just return empty members
+		members = []*calendar_member.CalendarMember{}
+	}
+
+	// Create response with all calendar fields plus members
+	response := struct {
+		*calendar.Calendar
+		Members []*calendar_member.CalendarMember `json:"members"`
+	}{
+		Calendar: cal,
+		Members:  members,
+	}
+
+	web.RespondJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) GetUserCalendars(w http.ResponseWriter, r *http.Request) {
-	accountID := r.PathValue("account_id")
+	accountID := r.URL.Query().Get("account_id")
+	if accountID == "" {
+		web.RespondError(w, http.StatusBadRequest, "account_id query parameter is required")
+		return
+	}
 
-	err, limitInt, offsetInt := ExtractLimitOffset(r, h.Config)
+	limitInt, offsetInt, err := ExtractLimitOffset(r, h.Config)
 	if err != nil {
 		web.RespondError(w, http.StatusBadRequest, "Invalid limit or offset", err.Error())
 		return
 	}
 
-	// Check if account exists first
-	exists, err := h.AccountRepo.CheckAccountExists(r.Context(), accountID)
+	// Get calendars owned by the user
+	ownedCalendars, err := h.CalendarRepo.GetUserCalendars(
+		r.Context(),
+		accountID,
+		limitInt,
+		offsetInt,
+	)
 	if err != nil {
-		logger.Error("Failed to check account exists: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to check account exists", err.Error())
-		return
-	}
-	if !exists {
-		logger.Warn("Account not found: %s", accountID)
-		web.RespondError(w, http.StatusNotFound, "Account not found", err.Error())
-		return
-	}
-
-	calendars, err := h.CalendarRepo.GetUserCalendars(r.Context(), accountID, limitInt, offsetInt)
-	if err != nil {
-		logger.Error("Failed to get calendars: %v", err)
+		logger.Error("Failed to get owned calendars: %v", err)
 		web.RespondError(w, http.StatusInternalServerError, "Failed to get calendars", err.Error())
 		return
 	}
 
-	web.ResponsePagedResults(w, calendars, len(calendars), limitInt, offsetInt)
+	// Get calendars where user is a member
+	memberCalendarUIDs, err := h.CalendarMemberRepo.GetMemberCalendars(
+		r.Context(),
+		accountID,
+		limitInt,
+		offsetInt,
+	)
+	if err != nil {
+		logger.Error("Failed to get member calendars: %v", err)
+		// Don't fail the request, just continue with owned calendars
+		memberCalendarUIDs = []uuid.UUID{}
+	}
+
+	// Fetch full calendar details for member calendars
+	memberCalendars := make([]*calendar.Calendar, 0, len(memberCalendarUIDs))
+	for _, calUID := range memberCalendarUIDs {
+		cal, err := h.CalendarRepo.GetCalendar(r.Context(), calUID)
+		if err != nil {
+			logger.Warn("Failed to get member calendar %s: %v", calUID, err)
+			continue
+		}
+		memberCalendars = append(memberCalendars, cal)
+	}
+
+	// Create response with ownership indicator and members
+	type CalendarWithMembers struct {
+		*calendar.Calendar
+		IsOwner bool                              `json:"is_owner"`
+		Members []*calendar_member.CalendarMember `json:"members"`
+	}
+
+	allCalendars := make([]CalendarWithMembers, 0, len(ownedCalendars)+len(memberCalendars))
+
+	// Add owned calendars
+	for _, cal := range ownedCalendars {
+		members, err := h.CalendarMemberRepo.GetCalendarMembers(r.Context(), cal.CalendarUID)
+		if err != nil {
+			logger.Warn("Failed to get members for calendar %s: %v", cal.CalendarUID, err)
+			members = []*calendar_member.CalendarMember{}
+		}
+
+		allCalendars = append(allCalendars, CalendarWithMembers{
+			Calendar: cal,
+			IsOwner:  true,
+			Members:  members,
+		})
+	}
+
+	// Add member calendars
+	for _, cal := range memberCalendars {
+		members, err := h.CalendarMemberRepo.GetCalendarMembers(r.Context(), cal.CalendarUID)
+		if err != nil {
+			logger.Warn("Failed to get members for calendar %s: %v", cal.CalendarUID, err)
+			members = []*calendar_member.CalendarMember{}
+		}
+
+		allCalendars = append(allCalendars, CalendarWithMembers{
+			Calendar: cal,
+			IsOwner:  false,
+			Members:  members,
+		})
+	}
+
+	web.ResponsePagedResults(w, allCalendars, len(allCalendars), limitInt, offsetInt)
 }
 
 func (h *Handler) UpdateCalendar(w http.ResponseWriter, r *http.Request) {
@@ -148,14 +219,24 @@ func (h *Handler) UpdateCalendar(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.CalendarRepo.UpdateCalendar(r.Context(), &cal); err != nil {
 		logger.Error("Failed to update calendar: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to update calendar", err.Error())
+		web.RespondError(
+			w,
+			http.StatusInternalServerError,
+			"Failed to update calendar",
+			err.Error(),
+		)
 		return
 	}
 
 	updatedCal, err := h.CalendarRepo.GetCalendar(r.Context(), calendarUID)
 	if err != nil {
 		logger.Error("Failed to get updated calendar: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to get updated calendar", err.Error())
+		web.RespondError(
+			w,
+			http.StatusInternalServerError,
+			"Failed to get updated calendar",
+			err.Error(),
+		)
 		return
 	}
 
@@ -182,7 +263,12 @@ func (h *Handler) DeleteCalendar(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.CalendarRepo.DeleteCalendar(r.Context(), calendarUID); err != nil {
 		logger.Error("Failed to delete calendar: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to delete calendar", err.Error())
+		web.RespondError(
+			w,
+			http.StatusInternalServerError,
+			"Failed to delete calendar",
+			err.Error(),
+		)
 		return
 	}
 

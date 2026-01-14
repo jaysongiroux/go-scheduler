@@ -1,116 +1,187 @@
-import { afterAll, describe, expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 import {
-  createAccount,
-  deleteAccount,
-  getAccount,
-  getAccounts,
-  updateAccount,
-} from "../helpers/account";
+  createCalendar,
+  getCalendar,
+  getUserCalendars,
+} from "../helpers/calendar";
+import { createEvent, getEvent } from "../helpers/event";
 import {
-  AccountObject,
+  CalendarObject,
   ErrorObject,
-  GenericPagedResponse,
-  SuccessObject,
+  EventObject,
+  ReminderObject,
 } from "../helpers/types";
+import { deleteAccount } from "../helpers/account";
+import {
+  inviteCalendarMembers,
+  getCalendarMembers,
+  updateCalendarMember,
+} from "../helpers/calendar-member";
+import { createReminder, getEventReminders } from "../helpers/reminder";
 
-describe("Account API", () => {
-  const accounts: string[] = [];
+describe("Deleting an account", () => {
+  test("Should delete events created by the account", async () => {
+    const accountId = crypto.randomUUID();
+    const calendar = (await createCalendar({
+      accountId,
+      metadata: { title: "example" },
+    })) as CalendarObject;
+    expect(calendar.calendar_uid).toBeDefined();
+    expect(calendar.account_id).toBe(accountId);
+    const event = (await createEvent({
+      accountId,
+      calendarUid: calendar.calendar_uid,
+      startTs: Math.floor(Date.now() / 1000),
+      endTs: Math.floor(Date.now() / 1000) + 3600,
+      metadata: { title: "example" },
+    })) as EventObject;
+    const fetchedEvent = (await getEvent({
+      eventUid: event.event_uid,
+    })) as EventObject;
+    expect(fetchedEvent.event_uid).toBe(event.event_uid);
+    expect(fetchedEvent.account_id).toBe(accountId);
+    expect(fetchedEvent.calendar_uid).toBe(calendar.calendar_uid);
+    expect(fetchedEvent.start_ts).toBe(Math.floor(Date.now() / 1000));
+    expect(fetchedEvent.end_ts).toBe(Math.floor(Date.now() / 1000) + 3600);
+    expect(fetchedEvent.metadata).toEqual({ title: "example" });
 
-  afterAll(async () => {
-    for (const account of accounts) {
-      const response = (await deleteAccount({
-        accountId: account,
-      })) as SuccessObject;
-      expect(response.success).toBe(true);
-    }
+    const response = await deleteAccount({ accountId });
+    expect(response.success).toBe(true);
   });
 
-  test("Should create an account", async () => {
-    const accountUUID = crypto.randomUUID();
-    const response = (await createAccount({
-      accountId: accountUUID,
-    })) as AccountObject;
-    expect(response.account_id).toBe(accountUUID);
-    accounts.push(response.account_id);
-  });
+  test("Should delete calendars created by the account", async () => {
+    const accountId = crypto.randomUUID();
 
-  test("Should not create a duplicate account", async () => {
-    const response = (await createAccount({
-      accountId: accounts[0],
-    })) as ErrorObject;
-    expect(response.error).toBe("Account already exists");
-    expect(response.details).toBe("Account already exists");
-  });
+    // Create a calendar
+    const calendar = (await createCalendar({
+      accountId,
+      metadata: { title: "Calendar to delete" },
+    })) as CalendarObject;
+    expect(calendar.calendar_uid).toBeDefined();
+    expect(calendar.account_id).toBe(accountId);
 
-  test("Should get an account", async () => {
-    const response = (await getAccount({
-      accountId: accounts[0],
-    })) as AccountObject;
-    expect(response.account_id).toBe(accounts[0]);
-  });
+    // Verify calendar exists
+    const fetchedCalendar = (await getCalendar({
+      calendarUid: calendar.calendar_uid,
+    })) as CalendarObject;
+    expect(fetchedCalendar.calendar_uid).toBe(calendar.calendar_uid);
 
-  test("Should update an account", async () => {
-    const response = (await updateAccount({
-      accountId: accounts[0],
-      settings: { edited: true },
-      metadata: { test: "value" },
-    })) as AccountObject;
-    expect(response.account_id).toBe(accounts[0]);
-    expect(response.settings).toEqual({ edited: true });
-    expect(response.metadata).toEqual({ test: "value" });
-  });
-
-  test("Should not update a non-existent account", async () => {
-    const response = (await updateAccount({
-      accountId: "nonexistent-account",
-      settings: { edited: true },
-      metadata: { test: "value" },
-    })) as ErrorObject;
-    expect(response.error).toBe("Account not found");
-    expect(response.details).toBe("Account not found");
-  });
-
-  test("Fetch accounts", async () => {
-    const response = (await getAccounts({
-      limit: 10,
-      offset: 0,
-      metadata: { test: "value" },
-      settings: { edited: true },
-    })) as GenericPagedResponse<AccountObject>;
-    expect(response.count).toBe(1);
-    expect(response.data[0].account_id).toBe(accounts[0]);
-    expect(response.data[0].settings).toEqual({ edited: true });
-    expect(response.data[0].metadata).toEqual({ test: "value" });
-
-    const response2 = (await getAccounts({
-      limit: 10,
-      offset: 1,
-      metadata: { test: "value" },
-      settings: { edited: true },
-    })) as GenericPagedResponse<AccountObject>;
-    expect(response2.count).toBe(0);
-    expect(response2.data).toEqual([]);
-  });
-
-  test("Should delete an account", async () => {
-    const response = (await deleteAccount({
-      accountId: accounts[0],
-    })) as SuccessObject;
+    // Delete account
+    const response = await deleteAccount({ accountId });
     expect(response.success).toBe(true);
 
-    const response2 = (await getAccount({
-      accountId: accounts[0],
+    // Verify calendar is deleted
+    const deletedCalendar = (await getCalendar({
+      calendarUid: calendar.calendar_uid,
     })) as ErrorObject;
-    expect(response2.error).toBe("Account not found");
+    expect(deletedCalendar.error).toBeDefined();
+    expect(deletedCalendar.error).toContain("not found");
+  });
 
-    // remove from accounts array
-    accounts.splice(accounts.indexOf(accounts[0]), 1);
+  test("Should delete the account's calendar members", async () => {
+    const ownerAccountId = crypto.randomUUID();
+    const memberAccountId = crypto.randomUUID();
 
-    // try to delete again
-    const response3 = (await deleteAccount({
-      accountId: accounts[0],
+    // Create a calendar as owner
+    const calendar = (await createCalendar({
+      accountId: ownerAccountId,
+      metadata: { title: "Shared Calendar" },
+    })) as CalendarObject;
+    expect(calendar.calendar_uid).toBeDefined();
+
+    // Invite member to calendar
+    const inviteResponse = await inviteCalendarMembers({
+      calendarUid: calendar.calendar_uid,
+      accountId: ownerAccountId,
+      accountIds: [memberAccountId],
+      role: "write",
+    });
+    expect(inviteResponse).toHaveProperty("invited_count");
+
+    // Member accepts invitation
+    await updateCalendarMember({
+      calendarUid: calendar.calendar_uid,
+      memberAccountId: memberAccountId,
+      requestingAccountId: memberAccountId,
+      status: "confirmed",
+    });
+
+    // Verify member is in calendar
+    const members = await getCalendarMembers({
+      calendarUid: calendar.calendar_uid,
+      accountId: ownerAccountId,
+    });
+    expect(Array.isArray(members)).toBe(true);
+    if (Array.isArray(members)) {
+      expect(members.length).toBe(1);
+      expect(members[0].account_id).toBe(memberAccountId);
+    }
+
+    // Delete member account
+    const response = await deleteAccount({ accountId: memberAccountId });
+    expect(response.success).toBe(true);
+
+    // Verify member is removed from calendar
+    const remainingMembers = await getCalendarMembers({
+      calendarUid: calendar.calendar_uid,
+      accountId: ownerAccountId,
+    });
+    expect(Array.isArray(remainingMembers)).toBe(true);
+    if (Array.isArray(remainingMembers)) {
+      expect(remainingMembers.length).toBe(0);
+    }
+
+    // Cleanup: delete owner account and calendar
+    await deleteAccount({ accountId: ownerAccountId });
+  });
+
+  test("Should delete reminders created by the account", async () => {
+    const accountId = crypto.randomUUID();
+
+    // Create calendar and event
+    const calendar = (await createCalendar({
+      accountId,
+      metadata: { title: "Calendar with reminders" },
+    })) as CalendarObject;
+
+    const now = Math.floor(Date.now() / 1000);
+    const event = (await createEvent({
+      accountId,
+      calendarUid: calendar.calendar_uid,
+      startTs: now + 7200,
+      endTs: now + 10800,
+      metadata: { title: "Event with reminder" },
+    })) as EventObject;
+    expect(event.event_uid).toBeDefined();
+
+    // Create reminder for the event
+    const reminder = (await createReminder({
+      eventUid: event.event_uid,
+      accountId,
+      offsetSeconds: -3600, // 1 hour before
+      metadata: { type: "notification" },
+    })) as any;
+
+    expect(reminder.reminder).toHaveProperty("reminder_uid");
+
+    // Verify reminder exists
+    const reminders = await getEventReminders({
+      eventUid: event.event_uid,
+    });
+    expect(Array.isArray(reminders)).toBe(true);
+    if (Array.isArray(reminders)) {
+      expect(reminders.length).toBe(1);
+      expect(reminders[0].account_id).toBe(accountId);
+    }
+
+    // Delete account
+    const response = await deleteAccount({ accountId });
+    expect(response.success).toBe(true);
+
+    // Verify event and reminders are deleted (event deletion cascades to reminders)
+    const deletedEvent = (await getEvent({
+      eventUid: event.event_uid,
     })) as ErrorObject;
-    expect(response3.error).toBe("Account not found");
-    expect(response3.details).toBe("Account not found");
+    expect(deletedEvent.error).toBeDefined();
   });
 });

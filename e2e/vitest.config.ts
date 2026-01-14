@@ -16,5 +16,8 @@ export default defineConfig({
     coverage: {
       enabled: false,
     },
+    cache: false,
+    hideSkippedTests: false,
+    allowOnly: false,
   },
 });

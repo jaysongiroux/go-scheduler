@@ -3,26 +3,11 @@
 -- ============================================================================
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ============================================================================
--- Accounts
--- ============================================================================
-CREATE TABLE IF NOT EXISTS accounts (
-    account_id TEXT PRIMARY KEY NOT NULL UNIQUE,
-    created_ts BIGINT NOT NULL,
-    updated_ts BIGINT NOT NULL,
-    settings JSON NOT NULL,
-    metadata JSONB NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_accounts_account_id ON accounts(account_id);
-CREATE INDEX IF NOT EXISTS idx_accounts_metadata ON accounts USING GIN(metadata);
--- Index for timestamp
-CREATE INDEX IF NOT EXISTS idx_accounts_updated_ts ON accounts(updated_ts);
-CREATE INDEX IF NOT EXISTS idx_accounts_created_ts ON accounts(created_ts);
--- ============================================================================
 -- Calendars
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS calendars (
     calendar_uid UUID PRIMARY KEY DEFAULT uuid_generate_v4() NOT NULL,
-    account_id TEXT NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
     created_ts BIGINT NOT NULL DEFAULT EXTRACT(
         EPOCH
         FROM NOW()
@@ -32,24 +17,60 @@ CREATE TABLE IF NOT EXISTS calendars (
         FROM NOW()
     )::BIGINT,
     settings JSON NOT NULL,
-    metadata JSONB NOT NULL
+    metadata JSONB NOT NULL,
+    -- ICS import fields
+    ics_url TEXT,
+    ics_auth_type TEXT CHECK (ics_auth_type IN ('none', 'basic', 'bearer')),
+    ics_auth_credentials BYTEA,
+    ics_last_sync_ts BIGINT,
+    ics_last_sync_status TEXT CHECK (
+        ics_last_sync_status IN ('success', 'stale', 'failed')
+    ),
+    ics_sync_interval_seconds INT DEFAULT 86400,
+    ics_error_message TEXT,
+    ics_last_etag TEXT,
+    ics_last_modified TEXT,
+    is_read_only BOOLEAN DEFAULT FALSE NOT NULL,
+    sync_on_partial_failure BOOLEAN DEFAULT TRUE NOT NULL
 );
 -- Optimized indexes for calendars
 CREATE INDEX IF NOT EXISTS idx_calendars_account_id ON calendars(account_id);
 CREATE INDEX IF NOT EXISTS idx_calendars_metadata ON calendars USING GIN(metadata);
--- Composite index for common query pattern (filtering by user and calendar together)
-CREATE INDEX IF NOT EXISTS idx_calendars_uid_account ON calendars(calendar_uid, account_id);
+-- ICS import indexes
+CREATE INDEX IF NOT EXISTS idx_calendars_ics_url ON calendars(ics_url)
+WHERE ics_url IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_calendars_next_sync ON calendars(ics_last_sync_ts, ics_sync_interval_seconds)
+WHERE ics_url IS NOT NULL;
+-- ============================================================================
+-- Calendar Members
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS calendar_members (
+    account_id TEXT NOT NULL,
+    calendar_uid UUID NOT NULL REFERENCES calendars(calendar_uid) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'confirmed')),
+    role TEXT NOT NULL CHECK (role IN ('read', 'write')) DEFAULT 'write',
+    invited_by TEXT NOT NULL,
+    invited_at_ts BIGINT NOT NULL,
+    updated_ts BIGINT NOT NULL,
+    PRIMARY KEY (account_id, calendar_uid)
+);
+-- Indexes for calendar_members
+CREATE INDEX IF NOT EXISTS idx_calendar_members_calendar ON calendar_members(calendar_uid);
+CREATE INDEX IF NOT EXISTS idx_calendar_members_account ON calendar_members(account_id);
+CREATE INDEX IF NOT EXISTS idx_calendar_members_status ON calendar_members(calendar_uid, status);
 -- ============================================================================
 -- Calendar Events
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS calendar_events (
     event_uid UUID PRIMARY KEY DEFAULT uuid_generate_v4() NOT NULL,
     calendar_uid UUID NOT NULL REFERENCES calendars(calendar_uid) ON DELETE CASCADE,
-    account_id TEXT NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
     start_ts BIGINT NOT NULL,
     duration BIGINT NOT NULL,
     end_ts BIGINT NOT NULL,
     created_ts BIGINT NOT NULL,
+    timezone TEXT,
+    local_start TEXT,
     updated_ts BIGINT NOT NULL,
     -- Recurrence tracking (master event fields)
     recurrence JSON,
@@ -108,13 +129,64 @@ WHERE is_recurring_instance = TRUE;
 -- Account-level queries with cancellation filter
 CREATE INDEX IF NOT EXISTS idx_events_account_time ON calendar_events(account_id, start_ts, end_ts)
 WHERE is_cancelled = FALSE;
+-- Add index for timezone queries (optional, for analytics)
+CREATE INDEX IF NOT EXISTS idx_events_timezone ON calendar_events(timezone)
+WHERE timezone IS NOT NULL;
+-- Add comments for documentation
+COMMENT ON COLUMN calendar_events.timezone IS 'IANA timezone string (e.g., America/New_York) for DST-aware scheduling';
+COMMENT ON COLUMN calendar_events.local_start IS 'Wall-clock time in RFC3339 format without offset, preserves local time intent';
+-- ============================================================================
+-- Calendar event attendees
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS event_attendees (
+    attendee_uid UUID PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+    event_uid UUID NOT NULL REFERENCES calendar_events(event_uid) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
+    master_event_uid UUID REFERENCES calendar_events(event_uid) ON DELETE CASCADE,
+    attendee_group_id UUID,
+    role TEXT NOT NULL CHECK (role IN ('organizer', 'attendee')),
+    rsvp_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        rsvp_status IN ('pending', 'accepted', 'declined', 'tentative')
+    ),
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_ts BIGINT NOT NULL DEFAULT EXTRACT(
+        EPOCH
+        FROM NOW()
+    ),
+    updated_ts BIGINT NOT NULL DEFAULT EXTRACT(
+        EPOCH
+        FROM NOW()
+    ),
+    archived BOOLEAN NOT NULL DEFAULT FALSE,
+    archived_ts BIGINT,
+    CONSTRAINT unique_event_attendee UNIQUE (event_uid, account_id)
+);
+-- Indexes for query optimization
+CREATE INDEX IF NOT EXISTS idx_attendee_event ON event_attendees(event_uid, archived);
+CREATE INDEX IF NOT EXISTS idx_attendee_account ON event_attendees(account_id, archived)
+WHERE archived = FALSE;
+CREATE INDEX IF NOT EXISTS idx_attendee_group ON event_attendees(attendee_group_id, archived)
+WHERE attendee_group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_attendee_master ON event_attendees(master_event_uid, archived)
+WHERE master_event_uid IS NOT NULL
+    AND archived = FALSE;
+CREATE INDEX IF NOT EXISTS idx_attendee_rsvp ON event_attendees(event_uid, rsvp_status)
+WHERE archived = FALSE;
+CREATE INDEX IF NOT EXISTS idx_attendee_role ON event_attendees(event_uid, role)
+WHERE archived = FALSE;
+-- For worker copy operations
+CREATE INDEX IF NOT EXISTS idx_attendee_worker_copy ON event_attendees(event_uid)
+WHERE archived = FALSE;
+-- For invited events query (join optimization)
+CREATE INDEX IF NOT EXISTS idx_attendee_account_time ON event_attendees(account_id, event_uid)
+WHERE archived = FALSE;
 -- ============================================================================
 -- Reminders
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS calendar_event_reminders (
     reminder_uid UUID PRIMARY KEY DEFAULT uuid_generate_v4() NOT NULL,
     event_uid UUID NOT NULL REFERENCES calendar_events(event_uid) ON DELETE CASCADE,
-    account_id TEXT NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
     master_event_uid UUID REFERENCES calendar_events(event_uid) ON DELETE CASCADE,
     reminder_group_id UUID,
     offset_seconds BIGINT NOT NULL,
@@ -308,47 +380,7 @@ SET failure_count = 0,
 WHERE webhook_uid = webhook_uuid;
 END;
 $$ LANGUAGE plpgsql;
--- ============================================================================
--- Views for Common Queries
--- ============================================================================
--- View for events with calendar and user info
-CREATE OR REPLACE VIEW v_events_detailed AS
-SELECT e.*,
-    c.account_id as calendar_account_id,
-    c.settings as calendar_settings,
-    c.metadata as calendar_metadata
-FROM calendar_events e
-    JOIN calendars c ON e.calendar_uid = c.calendar_uid;
--- View for active webhooks
-CREATE OR REPLACE VIEW v_active_webhooks AS
-SELECT w.*
-FROM webhooks w
-WHERE w.is_active = true;
--- ============================================================================
--- Statistics and Monitoring Views
--- ============================================================================
-CREATE OR REPLACE VIEW v_webhook_health AS
-SELECT w.webhook_uid,
-    w.url,
-    w.is_active,
-    w.failure_count,
-    w.last_success_at_ts,
-    w.last_failure_at_ts,
-    COUNT(wd.delivery_uid) as total_deliveries,
-    COUNT(wd.delivery_uid) FILTER (
-        WHERE wd.http_status >= 200
-            AND wd.http_status < 300
-    ) as successful_deliveries,
-    COUNT(wd.delivery_uid) FILTER (
-        WHERE wd.http_status >= 400
-            OR wd.http_status IS NULL
-    ) as failed_deliveries,
-    AVG(wd.response_time_ms) as avg_response_time_ms
-FROM webhooks w
-    LEFT JOIN webhook_deliveries wd ON w.webhook_uid = wd.webhook_uid
-GROUP BY w.webhook_uid,
-    w.url,
-    w.is_active,
-    w.failure_count,
-    w.last_success_at_ts,
-    w.last_failure_at_ts;
+-- Trigger to auto-update updated_ts on row changes
+DROP TRIGGER IF EXISTS trigger_attendees_updated ON event_attendees;
+CREATE TRIGGER trigger_attendees_updated BEFORE
+UPDATE ON event_attendees FOR EACH ROW EXECUTE FUNCTION set_updated_timestamp();

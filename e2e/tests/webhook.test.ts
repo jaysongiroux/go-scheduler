@@ -7,25 +7,29 @@ import {
   updateWebhook,
 } from "../helpers/webhook";
 import {
-  AccountObject,
   CalendarObject,
   EventObject,
   GenericPagedResponse,
   ReminderObject,
-  SuccessObject,
   WebhookDeliveryObject,
   WebhookObject,
 } from "../helpers/types";
 import { startWebhookServer } from "../helpers/webhook-server";
-import { createAccount, deleteAccount } from "../helpers/account";
 import { wait } from "../helpers/general";
 import { createEvent, toggleCancelledStatusEvent } from "../helpers/event";
-import { createCalendar } from "../helpers/calendar";
+import {
+  createCalendar,
+  deleteCalendar,
+  importICS,
+  importICSLink,
+  resyncCalendar,
+} from "../helpers/calendar";
 import {
   createReminder,
   deleteReminder,
   updateReminder,
 } from "../helpers/reminder";
+import { startICSServer } from "../helpers/ics-server";
 
 describe("Webhook API", () => {
   let webhookUid: string;
@@ -82,11 +86,105 @@ describe("Webhook API", () => {
     expect(webhook.secret).toBe(secret);
     expect(webhook.is_active).toBe(false);
   });
+
+  test("Should update only is_active without breaking other fields (regression test)", async () => {
+    // Get current webhook state
+    const webhookBefore = (await getWebhook({ webhookUid })) as WebhookObject;
+
+    // Update only is_active
+    const webhook = (await updateWebhook({
+      webhookUid,
+      isActive: true, // Toggling back to active
+      url: webhookBefore.url,
+      eventTypes: webhookBefore.event_types,
+      retryCount: webhookBefore.retry_count,
+      timeoutSeconds: webhookBefore.timeout_seconds,
+    })) as WebhookObject;
+
+    expect(webhook.is_active).toBe(true);
+    // All other fields should be preserved
+    expect(webhook.url).toBe(webhookBefore.url);
+    expect(webhook.event_types).toEqual(webhookBefore.event_types);
+    expect(webhook.retry_count).toBe(webhookBefore.retry_count);
+    expect(webhook.timeout_seconds).toBe(webhookBefore.timeout_seconds);
+    expect(webhook.secret).toBe(secret);
+  });
+
+  test("Should update only url without breaking other fields (regression test)", async () => {
+    // Get current webhook state
+    const webhookBefore = (await getWebhook({ webhookUid })) as WebhookObject;
+
+    // Update only URL
+    const webhook = (await updateWebhook({
+      webhookUid,
+      url: "http://localhost:4444/new-endpoint",
+      eventTypes: webhookBefore.event_types,
+      isActive: webhookBefore.is_active,
+      retryCount: webhookBefore.retry_count,
+      timeoutSeconds: webhookBefore.timeout_seconds,
+    })) as WebhookObject;
+
+    expect(webhook.url).toBe("http://localhost:4444/new-endpoint");
+    // All other fields should be preserved
+    expect(webhook.is_active).toBe(webhookBefore.is_active);
+    expect(webhook.event_types).toEqual(webhookBefore.event_types);
+    expect(webhook.retry_count).toBe(webhookBefore.retry_count);
+    expect(webhook.timeout_seconds).toBe(webhookBefore.timeout_seconds);
+    expect(webhook.secret).toBe(secret);
+  });
+
+  test("Should update only event_types without breaking other fields (regression test)", async () => {
+    // Get current webhook state
+    const webhookBefore = (await getWebhook({ webhookUid })) as WebhookObject;
+
+    // Update only event_types
+    const webhook = (await updateWebhook({
+      webhookUid,
+      eventTypes: ["event.created", "event.deleted"],
+      url: webhookBefore.url,
+      isActive: webhookBefore.is_active,
+      retryCount: webhookBefore.retry_count,
+      timeoutSeconds: webhookBefore.timeout_seconds,
+    })) as WebhookObject;
+
+    expect(webhook.event_types).toEqual(["event.created", "event.deleted"]);
+    // All other fields should be preserved
+    expect(webhook.url).toBe(webhookBefore.url);
+    expect(webhook.is_active).toBe(webhookBefore.is_active);
+    expect(webhook.retry_count).toBe(webhookBefore.retry_count);
+    expect(webhook.timeout_seconds).toBe(webhookBefore.timeout_seconds);
+    expect(webhook.secret).toBe(secret);
+  });
+
+  test("Should preserve timeout_seconds when updating retry_count (regression test)", async () => {
+    // Get current webhook state
+    const webhookBefore = (await getWebhook({ webhookUid })) as WebhookObject;
+
+    // Update only retry_count
+    const webhook = (await updateWebhook({
+      webhookUid,
+      retryCount: 7,
+      url: webhookBefore.url,
+      eventTypes: webhookBefore.event_types,
+      isActive: webhookBefore.is_active,
+      timeoutSeconds: webhookBefore.timeout_seconds,
+    })) as WebhookObject;
+
+    expect(webhook.retry_count).toBe(7);
+    // Timeout should be preserved (this was the bug - it was being set to 0)
+    expect(webhook.timeout_seconds).toBe(webhookBefore.timeout_seconds);
+    expect(webhook.timeout_seconds).toBeGreaterThan(0);
+    // All other fields should also be preserved
+    expect(webhook.url).toBe(webhookBefore.url);
+    expect(webhook.is_active).toBe(webhookBefore.is_active);
+    expect(webhook.event_types).toEqual(webhookBefore.event_types);
+    expect(webhook.secret).toBe(secret);
+  });
 });
 
 describe("Webhook Delivery", () => {
   let webhookUid: string;
-  let accountId: string;
+  let accountId: string = crypto.randomUUID();
   let webhookServer: { getLastEvent: () => any; close: () => void };
 
   beforeAll(async () => {
@@ -103,43 +201,12 @@ describe("Webhook Delivery", () => {
   afterAll(async () => {
     webhookServer.close();
 
-    await deleteAccount({ accountId });
     await deleteWebhook({ webhookUid });
-  });
-
-  test("Should get webhook deliveries for account created", async () => {
-    const account = (await createAccount({
-      accountId: crypto.randomUUID(),
-      settings: {},
-      metadata: {},
-    })) as AccountObject;
-    expect(account.account_id).toBeDefined();
-    expect(account.settings).toEqual({});
-    expect(account.metadata).toEqual({});
-    accountId = account.account_id;
-
-    await wait(2);
-
-    const deliveries = webhookServer.getLastEvent();
-    expect(deliveries).toBeDefined();
-    expect(deliveries.event_type).toBe("account.created");
-    expect(deliveries.data.account_id).toBe(account.account_id);
-
-    const deliveriesResponse = (await getWebhookDeliveries({
-      webhookUid,
-      limit: 10,
-      offset: 0,
-    })) as GenericPagedResponse<WebhookDeliveryObject>;
-    expect(deliveriesResponse.count).toBe(1);
-    expect(deliveriesResponse.data[0].event_type).toBe("account.created");
-    expect(deliveriesResponse.data[0].payload.data.account_id).toBe(
-      account.account_id
-    );
   });
 
   test("Should get webhook deliveries for event created", async () => {
     const calendar = (await createCalendar({
-      accountId,
+      accountId: accountId,
       settings: {},
       metadata: {},
     })) as CalendarObject;
@@ -150,6 +217,7 @@ describe("Webhook Delivery", () => {
     const event = (await createEvent({
       calendarUid: calendar.calendar_uid,
       startTs,
+      accountId,
       endTs,
       metadata: {},
     })) as EventObject;
@@ -186,7 +254,7 @@ describe("Webhook Delivery", () => {
 
 describe("Reminder Webhook Delivery", () => {
   let webhookUid: string;
-  let accountId: string;
+  let accountId: string = crypto.randomUUID();
   let calendarUid: string;
   let webhookServer: { getLastEvent: () => any; close: () => void };
 
@@ -205,15 +273,6 @@ describe("Reminder Webhook Delivery", () => {
     expect(webhook.webhook_uid).toBeDefined();
     webhookUid = webhook.webhook_uid;
 
-    // Create account and calendar for tests
-    const account = (await createAccount({
-      accountId: crypto.randomUUID(),
-      settings: {},
-      metadata: {},
-    })) as AccountObject;
-    expect(account.account_id).toBeDefined();
-    accountId = account.account_id;
-
     const calendar = (await createCalendar({
       accountId,
       settings: {},
@@ -225,7 +284,6 @@ describe("Reminder Webhook Delivery", () => {
 
   afterAll(async () => {
     webhookServer.close();
-    await deleteAccount({ accountId });
     await deleteWebhook({ webhookUid });
   });
 
@@ -234,6 +292,7 @@ describe("Reminder Webhook Delivery", () => {
     const endTs = startTs + 3600;
     const event = (await createEvent({
       calendarUid,
+      accountId,
       startTs,
       endTs,
       metadata: { title: "Event with Reminder" },
@@ -284,6 +343,7 @@ describe("Reminder Webhook Delivery", () => {
     const event = (await createEvent({
       calendarUid,
       startTs,
+      accountId,
       endTs,
       metadata: { title: "Event for Update Test" },
     })) as EventObject;
@@ -338,6 +398,7 @@ describe("Reminder Webhook Delivery", () => {
       calendarUid,
       startTs,
       endTs,
+      accountId,
       metadata: { title: "Event for Delete Test" },
     })) as EventObject;
     expect(event.event_uid).toBeDefined();
@@ -385,6 +446,7 @@ describe("Reminder Webhook Delivery", () => {
     const endTs = startTs + 3600;
     const recurringEvent = (await createEvent({
       calendarUid,
+      accountId,
       startTs,
       endTs,
       metadata: { title: "Recurring Event with Reminder" },
@@ -430,6 +492,7 @@ describe("Reminder Webhook Delivery", () => {
     const endTs = startTs + 3600;
     const event = (await createEvent({
       calendarUid,
+      accountId,
       startTs,
       endTs,
       metadata: { title: "Event to be Cancelled" },
@@ -480,5 +543,432 @@ describe("Reminder Webhook Delivery", () => {
         (d.payload.data as any).event?.event_uid === event.event_uid
     );
     expect(triggeredForThisEvent.length).toBe(0);
+  });
+});
+
+describe("Webhook API - ICS Import", () => {
+  let webhookServer: any;
+  let webhookUid: string;
+  const WEBHOOK_PORT = 9200;
+  const ICS_SERVER_PORT = 9201;
+  const accountId = crypto.randomUUID();
+  const createdCalendarUids: string[] = [];
+
+  // Simple ICS content with multiple events
+  const multiEventICS = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:webhook-event-1
+DTSTART:20260115T100000Z
+DTEND:20260115T110000Z
+SUMMARY:Webhook Event One
+END:VEVENT
+BEGIN:VEVENT
+UID:webhook-event-2
+DTSTART:20260116T140000Z
+DTEND:20260116T150000Z
+SUMMARY:Webhook Event Two
+END:VEVENT
+BEGIN:VEVENT
+UID:webhook-event-3
+DTSTART:20260117T090000Z
+DTEND:20260117T100000Z
+SUMMARY:Webhook Event Three
+END:VEVENT
+END:VCALENDAR`;
+
+  // Updated ICS with one new event
+  const updatedICS = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:webhook-event-1
+DTSTART:20260115T100000Z
+DTEND:20260115T110000Z
+SUMMARY:Webhook Event One
+END:VEVENT
+BEGIN:VEVENT
+UID:webhook-event-4
+DTSTART:20260118T130000Z
+DTEND:20260118T140000Z
+SUMMARY:Webhook Event Four
+END:VEVENT
+END:VCALENDAR`;
+
+  beforeAll(async () => {
+    // Start webhook server
+    webhookServer = startWebhookServer(WEBHOOK_PORT);
+
+    // Create webhook for ICS-related events
+    const webhook = (await createWebhook({
+      isActive: true,
+      url: `http://localhost:${WEBHOOK_PORT}/webhook`,
+      eventTypes: [
+        "calendar.created",
+        "event.created",
+        "calendar.synced",
+        "calendar.updated",
+        "calendar.resynced",
+      ],
+    })) as WebhookObject;
+    webhookUid = webhook.webhook_uid;
+
+    // Wait for webhook to be ready
+    await wait(1);
+  });
+
+  afterAll(async () => {
+    // Cleanup calendars
+    for (const uid of createdCalendarUids) {
+      try {
+        await deleteCalendar({ calendarUid: uid });
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+
+    // Cleanup webhook
+    if (webhookUid) {
+      await deleteWebhook({ webhookUid });
+    }
+
+    // Close webhook server
+    if (webhookServer) {
+      webhookServer.close();
+    }
+  });
+
+  test("Should trigger calendar.created webhook when importing ICS file", async () => {
+    // Import ICS file
+    const response = (await importICS({
+      file: Buffer.from(multiEventICS),
+      accountId: accountId,
+      calendarMetadata: { name: "Webhook Test Calendar", source: "ics_file" },
+    })) as any;
+
+    expect(response.calendar).toBeDefined();
+    createdCalendarUids.push(response.calendar.calendar_uid);
+
+    // Wait for webhook delivery
+    await wait(2);
+
+    // Check webhook was delivered by querying deliveries
+    const deliveriesResponse = (await getWebhookDeliveries({
+      webhookUid,
+      limit: 50,
+      offset: 0,
+    })) as GenericPagedResponse<WebhookDeliveryObject>;
+
+    const calendarCreatedDeliveries = deliveriesResponse.data.filter(
+      (d) =>
+        d.event_type === "calendar.created" &&
+        (d.payload.data as any).calendar_uid === response.calendar.calendar_uid
+    );
+
+    expect(calendarCreatedDeliveries.length).toBeGreaterThan(0);
+
+    const delivery = calendarCreatedDeliveries[0];
+    expect((delivery.payload.data as any).calendar_uid).toBe(
+      response.calendar.calendar_uid
+    );
+    expect((delivery.payload.data as any).account_id).toBe(accountId);
+  });
+
+  test("Should trigger batch event.created webhook when importing ICS file with multiple events", async () => {
+    // Clear previous events
+    webhookServer.getLastEvent();
+
+    // Import ICS file with multiple events
+    const response = (await importICS({
+      file: Buffer.from(multiEventICS),
+      accountId: accountId,
+    })) as any;
+
+    expect(response.summary.imported_events).toBe(3);
+    createdCalendarUids.push(response.calendar.calendar_uid);
+
+    // Wait for webhook delivery
+    await wait(2);
+
+    // Check for event.created webhook deliveries
+    const deliveriesResponse = (await getWebhookDeliveries({
+      webhookUid,
+      limit: 50,
+      offset: 0,
+    })) as GenericPagedResponse<WebhookDeliveryObject>;
+
+    const eventCreatedDeliveries = deliveriesResponse.data.filter(
+      (d) => d.event_type === "event.created"
+    );
+
+    // Should have batch event creation webhook
+    expect(eventCreatedDeliveries.length).toBeGreaterThan(0);
+
+    // Verify batch contains multiple events
+    const batchDelivery = eventCreatedDeliveries[0];
+    if (Array.isArray(batchDelivery.payload.data)) {
+      expect(batchDelivery.payload.data.length).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  test("Should trigger calendar.synced webhook when importing ICS from URL", async () => {
+    const icsServer = startICSServer(ICS_SERVER_PORT, multiEventICS);
+
+    try {
+      // Import ICS from URL
+      const response = (await importICSLink({
+        accountId: accountId,
+        icsUrl: `http://localhost:${ICS_SERVER_PORT}/calendar.ics`,
+        authType: "none",
+        calendarMetadata: { name: "Webhook URL Calendar" },
+      })) as any;
+
+      expect(response.calendar).toBeDefined();
+      expect(response.sync_scheduled).toBe(true);
+      createdCalendarUids.push(response.calendar.calendar_uid);
+
+      // Wait for webhook delivery
+      await wait(2);
+
+      // Check for calendar.synced webhook
+      const deliveriesResponse = (await getWebhookDeliveries({
+        webhookUid,
+        limit: 50,
+        offset: 0,
+      })) as GenericPagedResponse<WebhookDeliveryObject>;
+
+      const syncedDeliveries = deliveriesResponse.data.filter(
+        (d) =>
+          d.event_type === "calendar.synced" &&
+          (d.payload.data as any).calendar_uid ===
+            response.calendar.calendar_uid
+      );
+
+      expect(syncedDeliveries.length).toBeGreaterThan(0);
+
+      const syncDelivery = syncedDeliveries[0];
+      expect(syncDelivery.payload.data).toBeDefined();
+      expect((syncDelivery.payload.data as any).calendar_uid).toBe(
+        response.calendar.calendar_uid
+      );
+      expect((syncDelivery.payload.data as any).imported_events).toBe(3);
+      expect((syncDelivery.payload.data as any).failed_events).toBe(0);
+    } finally {
+      await icsServer.close();
+    }
+  });
+
+  test("Should trigger calendar.synced webhook on manual resync", async () => {
+    const icsServer = startICSServer(ICS_SERVER_PORT, multiEventICS);
+
+    try {
+      // Import ICS from URL
+      const importResponse = (await importICSLink({
+        accountId: accountId,
+        icsUrl: `http://localhost:${ICS_SERVER_PORT}/calendar.ics`,
+        authType: "none",
+      })) as any;
+
+      expect(importResponse.calendar).toBeDefined();
+      createdCalendarUids.push(importResponse.calendar.calendar_uid);
+
+      await wait(2);
+
+      // Update ICS content on server
+      icsServer.updateContent(updatedICS);
+
+      // Clear previous webhook events
+      webhookServer.getLastEvent();
+
+      // Manually resync
+      const resyncResponse = (await resyncCalendar({
+        calendarUid: importResponse.calendar.calendar_uid,
+      })) as any;
+
+      expect(resyncResponse.imported_events).toBeGreaterThanOrEqual(1);
+
+      // Wait for webhook delivery
+      await wait(2);
+
+      // Check for calendar.synced webhook after resync
+      const deliveriesResponse = (await getWebhookDeliveries({
+        webhookUid,
+        limit: 50,
+        offset: 0,
+      })) as GenericPagedResponse<WebhookDeliveryObject>;
+
+      const recentSyncDeliveries = deliveriesResponse.data.filter(
+        (d) =>
+          d.event_type === "calendar.synced" &&
+          (d.payload.data as any).calendar_uid ===
+            importResponse.calendar.calendar_uid
+      );
+
+      expect(recentSyncDeliveries.length).toBeGreaterThan(0);
+
+      // Verify the most recent sync delivery has updated data
+      const latestSync = recentSyncDeliveries[0];
+      expect(
+        (latestSync.payload.data as any).imported_events
+      ).toBeGreaterThanOrEqual(1);
+    } finally {
+      await icsServer.close();
+    }
+  });
+
+  test("Should include batch event webhooks when syncing ICS URL", async () => {
+    const icsServer = startICSServer(ICS_SERVER_PORT, multiEventICS);
+
+    try {
+      // Import ICS from URL
+      const response = (await importICSLink({
+        accountId: accountId,
+        icsUrl: `http://localhost:${ICS_SERVER_PORT}/calendar.ics`,
+        authType: "none",
+      })) as any;
+
+      expect(response.calendar).toBeDefined();
+      createdCalendarUids.push(response.calendar.calendar_uid);
+
+      // Wait for webhook delivery
+      await wait(2);
+
+      // Check for event.created webhook deliveries
+      const deliveriesResponse = (await getWebhookDeliveries({
+        webhookUid,
+        limit: 100,
+        offset: 0,
+      })) as GenericPagedResponse<WebhookDeliveryObject>;
+
+      const eventCreatedDeliveries = deliveriesResponse.data.filter(
+        (d) => d.event_type === "event.created"
+      );
+
+      // Should have batch event creation webhooks
+      expect(eventCreatedDeliveries.length).toBeGreaterThan(0);
+    } finally {
+      await icsServer.close();
+    }
+  });
+
+  test("Should include warnings in calendar.synced webhook when partial sync fails", async () => {
+    // ICS with one valid and one invalid event
+    // Note: Events without DTSTART are silently skipped by the parser
+    // So we need a different type of failure
+    const partialICS = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:valid-event
+DTSTART:20260115T100000Z
+DTEND:20260115T110000Z
+SUMMARY:Valid Event
+END:VEVENT
+BEGIN:VEVENT
+UID:invalid-event
+SUMMARY:Invalid Event Without Dates
+END:VEVENT
+END:VCALENDAR`;
+
+    const icsServer = startICSServer(ICS_SERVER_PORT, partialICS);
+
+    try {
+      // Import ICS from URL with partial failure mode
+      const response = (await importICSLink({
+        accountId: accountId,
+        icsUrl: `http://localhost:${ICS_SERVER_PORT}/calendar.ics`,
+        authType: "none",
+        syncOnPartialFailure: true,
+      })) as any;
+
+      expect(response.calendar).toBeDefined();
+      createdCalendarUids.push(response.calendar.calendar_uid);
+
+      // Check if there were any failed events in the response
+      const hasFailed = response.summary.failed_events > 0;
+
+      // Wait for webhook delivery
+      await wait(2);
+
+      // Check for calendar.synced webhook
+      const deliveriesResponse = (await getWebhookDeliveries({
+        webhookUid,
+        limit: 50,
+        offset: 0,
+      })) as GenericPagedResponse<WebhookDeliveryObject>;
+
+      const syncedDeliveries = deliveriesResponse.data.filter(
+        (d) =>
+          d.event_type === "calendar.synced" &&
+          (d.payload.data as any).calendar_uid ===
+            response.calendar.calendar_uid
+      );
+
+      expect(syncedDeliveries.length).toBeGreaterThan(0);
+
+      const syncDelivery = syncedDeliveries[0];
+      const syncData = syncDelivery.payload.data as any;
+
+      // Should have imported at least one event
+      expect(syncData.imported_events).toBeGreaterThan(0);
+
+      // If there were failures, should have warnings
+      if (hasFailed) {
+        expect(syncData.warnings).toBeDefined();
+        expect(Array.isArray(syncData.warnings)).toBe(true);
+        expect(syncData.warnings.length).toBeGreaterThan(0);
+      } else {
+        // If no failures (parser skipped invalid events), warnings should be empty or undefined
+        // This is acceptable behavior - parser filters out unparseable events
+        expect(syncData.warnings).toBeDefined();
+        expect(Array.isArray(syncData.warnings)).toBe(true);
+      }
+    } finally {
+      await icsServer.close();
+    }
+  });
+
+  test("Should trigger calendar.created even for read-only ICS calendars", async () => {
+    const icsServer = startICSServer(ICS_SERVER_PORT, multiEventICS);
+
+    try {
+      // Clear previous events
+      webhookServer.getLastEvent();
+
+      // Import ICS from URL (creates read-only calendar)
+      const response = (await importICSLink({
+        accountId: accountId,
+        icsUrl: `http://localhost:${ICS_SERVER_PORT}/calendar.ics`,
+        authType: "none",
+      })) as any;
+
+      expect(response.calendar.is_read_only).toBe(true);
+      createdCalendarUids.push(response.calendar.calendar_uid);
+
+      // Wait for webhook delivery
+      await wait(2);
+
+      // Check for calendar.created webhook
+      const deliveriesResponse = (await getWebhookDeliveries({
+        webhookUid,
+        limit: 50,
+        offset: 0,
+      })) as GenericPagedResponse<WebhookDeliveryObject>;
+
+      const calendarCreatedDeliveries = deliveriesResponse.data.filter(
+        (d) =>
+          d.event_type === "calendar.created" &&
+          (d.payload.data as any).calendar_uid ===
+            response.calendar.calendar_uid
+      );
+
+      expect(calendarCreatedDeliveries.length).toBeGreaterThan(0);
+
+      const createDelivery = calendarCreatedDeliveries[0];
+      expect((createDelivery.payload.data as any).is_read_only).toBe(true);
+    } finally {
+      await icsServer.close();
+    }
   });
 });

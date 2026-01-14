@@ -16,6 +16,7 @@ import (
 type Webhook struct {
 	WebhookUID        uuid.UUID      `json:"webhook_uid"`
 	URL               string         `json:"url"`
+	// #nosec G117 -- webhook signing secret by design
 	Secret            string         `json:"secret"`
 	EventTypes        pq.StringArray `json:"event_types"`
 	IsActive          bool           `json:"is_active"`
@@ -473,7 +474,12 @@ func (q *Queries) GetPendingWebhookJobs(ctx context.Context) ([]*WebhookJob, err
 			job.ErrorMessage = errorMessage
 		}
 
-		logger.Debug("Scanned job: %s (status: %s, next_retry: %d)", job.JobUID, job.Status, job.NextRetryTs)
+		logger.Debug(
+			"Scanned job: %s (status: %s, next_retry: %d)",
+			job.JobUID,
+			job.Status,
+			job.NextRetryTs,
+		)
 		jobs = append(jobs, &job)
 	}
 

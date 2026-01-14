@@ -56,7 +56,11 @@ func (h *Handler) CreateReminder(w http.ResponseWriter, r *http.Request) {
 
 	// Validate offset_seconds (must be negative - reminder before event)
 	if req.OffsetSeconds > 0 {
-		web.RespondError(w, http.StatusBadRequest, "offset_seconds must be negative (time before event)")
+		web.RespondError(
+			w,
+			http.StatusBadRequest,
+			"offset_seconds must be negative (time before event)",
+		)
 		return
 	}
 
@@ -67,18 +71,6 @@ func (h *Handler) CreateReminder(w http.ResponseWriter, r *http.Request) {
 	// account ID is required
 	if req.AccountID == "" {
 		web.RespondError(w, http.StatusBadRequest, "account_id is required")
-		return
-	}
-
-	// Check if account exists
-	exists, err := h.AccountRepo.CheckAccountExists(r.Context(), req.AccountID)
-	if err != nil {
-		web.RespondError(w, http.StatusInternalServerError, "Failed to check account exists", err.Error())
-		return
-	}
-
-	if !exists {
-		web.RespondError(w, http.StatusNotFound, "Account not found", req.AccountID)
 		return
 	}
 
@@ -93,9 +85,52 @@ func (h *Handler) CreateReminder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if calendar is read-only
+	cal, err := h.CalendarRepo.GetCalendar(r.Context(), evt.CalendarUID)
+	if err != nil {
+		logger.Warn("Failed to get calendar: %v", err)
+		web.RespondError(w, http.StatusNotFound, "Calendar not found", err.Error())
+		return
+	}
+
+	if cal.IsReadOnly {
+		web.RespondError(
+			w,
+			http.StatusForbidden,
+			"Cannot create reminders on read-only calendar",
+		)
+		return
+	}
+
+	// Validate that the account is an attendee of this event
+	if h.AttendeeRepo != nil {
+		isAttendee, err := h.AttendeeRepo.IsAccountAttendee(r.Context(), eventUID, req.AccountID)
+		if err != nil {
+			web.RespondError(
+				w,
+				http.StatusInternalServerError,
+				"Failed to check attendee status",
+				err.Error(),
+			)
+			return
+		}
+		if !isAttendee {
+			web.RespondError(
+				w,
+				http.StatusForbidden,
+				"Only attendees can create reminders for this event",
+			)
+			return
+		}
+	}
+
 	// Validate scope for recurring events
 	if (evt.IsRecurringInstance || evt.IsMasterEvent()) && req.Scope == "" {
-		web.RespondError(w, http.StatusBadRequest, "Scope is required for recurring events (single or all)")
+		web.RespondError(
+			w,
+			http.StatusBadRequest,
+			"Scope is required for recurring events (single or all)",
+		)
 		return
 	}
 
@@ -124,7 +159,12 @@ func (h *Handler) CreateReminder(w http.ResponseWriter, r *http.Request) {
 		// Create single reminder for this event only
 		reminder, err = h.ReminderRepo.CreateSingleReminder(r.Context(), rm)
 		if err != nil {
-			web.RespondError(w, http.StatusInternalServerError, "Failed to create reminder", err.Error())
+			web.RespondError(
+				w,
+				http.StatusInternalServerError,
+				"Failed to create reminder",
+				err.Error(),
+			)
 			return
 		}
 		count = 1
@@ -251,7 +291,11 @@ func (h *Handler) UpdateReminder(w http.ResponseWriter, r *http.Request) {
 
 	// Validate offset_seconds (must be negative)
 	if req.OffsetSeconds > 0 {
-		web.RespondError(w, http.StatusBadRequest, "offset_seconds must be negative (time before event)")
+		web.RespondError(
+			w,
+			http.StatusBadRequest,
+			"offset_seconds must be negative (time before event)",
+		)
 		return
 	}
 
@@ -287,9 +331,30 @@ func (h *Handler) UpdateReminder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if calendar is read-only
+	cal, err := h.CalendarRepo.GetCalendar(r.Context(), evt.CalendarUID)
+	if err != nil {
+		logger.Warn("Failed to get calendar: %v", err)
+		web.RespondError(w, http.StatusNotFound, "Calendar not found", err.Error())
+		return
+	}
+
+	if cal.IsReadOnly {
+		web.RespondError(
+			w,
+			http.StatusForbidden,
+			"Cannot update reminders on read-only calendar",
+		)
+		return
+	}
+
 	// Validate scope for recurring events
 	if (evt.IsRecurringInstance || evt.IsMasterEvent()) && req.Scope == "" {
-		web.RespondError(w, http.StatusBadRequest, "Scope is required for recurring events (single or all)")
+		web.RespondError(
+			w,
+			http.StatusBadRequest,
+			"Scope is required for recurring events (single or all)",
+		)
 		return
 	}
 
@@ -318,7 +383,12 @@ func (h *Handler) UpdateReminder(w http.ResponseWriter, r *http.Request) {
 			rm,
 		)
 		if err != nil {
-			web.RespondError(w, http.StatusInternalServerError, "Failed to update reminder", err.Error())
+			web.RespondError(
+				w,
+				http.StatusInternalServerError,
+				"Failed to update reminder",
+				err.Error(),
+			)
 			return
 		}
 		count = 1
@@ -432,9 +502,30 @@ func (h *Handler) DeleteReminder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if calendar is read-only
+	cal, err := h.CalendarRepo.GetCalendar(r.Context(), evt.CalendarUID)
+	if err != nil {
+		logger.Warn("Failed to get calendar: %v", err)
+		web.RespondError(w, http.StatusNotFound, "Calendar not found", err.Error())
+		return
+	}
+
+	if cal.IsReadOnly {
+		web.RespondError(
+			w,
+			http.StatusForbidden,
+			"Cannot delete reminders from read-only calendar",
+		)
+		return
+	}
+
 	// Validate scope for recurring events
 	if (evt.IsRecurringInstance || evt.IsMasterEvent()) && scope == "" {
-		web.RespondError(w, http.StatusBadRequest, "Scope is required for recurring events (single or all)")
+		web.RespondError(
+			w,
+			http.StatusBadRequest,
+			"Scope is required for recurring events (single or all)",
+		)
 		return
 	}
 
@@ -455,7 +546,12 @@ func (h *Handler) DeleteReminder(w http.ResponseWriter, r *http.Request) {
 		// Delete single reminder only
 		err = h.ReminderRepo.DeleteSingleReminder(r.Context(), reminderUID)
 		if err != nil {
-			web.RespondError(w, http.StatusInternalServerError, "Failed to delete reminder", err.Error())
+			web.RespondError(
+				w,
+				http.StatusInternalServerError,
+				"Failed to delete reminder",
+				err.Error(),
+			)
 			return
 		}
 		count = 1

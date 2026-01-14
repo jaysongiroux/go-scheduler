@@ -12,7 +12,6 @@ import (
 	"github.com/jaysongiroux/go-scheduler/internal/logger"
 )
 
-// TODO: replace q with Reminder instead - maybe?
 // Queries holds the database connection pool
 type Queries struct {
 	pool *db.ConnectionPool
@@ -23,11 +22,63 @@ func New(pool *db.ConnectionPool) *Queries {
 	return &Queries{pool: pool}
 }
 
+// scanReminderRow scans a database row into a Reminder struct and handles nullable fields
+func scanReminderRow(rows interface {
+	Scan(dest ...interface{}) error
+}) (*event.Reminder, error) {
+	var r event.Reminder
+	var masterEventUID, reminderGroupID, deliveredTs, archivedTs sql.NullString
+
+	err := rows.Scan(
+		&r.ReminderUID,
+		&r.EventUID,
+		&r.AccountID,
+		&masterEventUID,
+		&reminderGroupID,
+		&r.OffsetSeconds,
+		&r.Metadata,
+		&r.IsDelivered,
+		&deliveredTs,
+		&r.CreatedTs,
+		&r.Archived,
+		&archivedTs,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Handle nullable fields
+	if masterEventUID.Valid {
+		uid, _ := uuid.Parse(masterEventUID.String)
+		r.MasterEventUID = &uid
+	}
+	if reminderGroupID.Valid {
+		uid, _ := uuid.Parse(reminderGroupID.String)
+		r.ReminderGroupID = &uid
+	}
+	if deliveredTs.Valid {
+		ts, _ := strconv.ParseInt(deliveredTs.String, 10, 64)
+		r.DeliveredTs = &ts
+	}
+	if archivedTs.Valid {
+		ts, _ := strconv.ParseInt(archivedTs.String, 10, 64)
+		r.ArchivedTs = &ts
+	}
+
+	return &r, nil
+}
+
 // CreateSingleReminder creates a one-off reminder for a specific event (scope="single")
 func (q *Queries) CreateSingleReminder(
 	ctx context.Context,
 	rm *event.Reminder,
 ) (*event.Reminder, error) {
+	// metadata is NOT NULL in DB, use empty object if nil
+	metadata := rm.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+
 	query := `
 		INSERT INTO calendar_event_reminders (
 			reminder_uid, event_uid, account_id, master_event_uid,
@@ -57,7 +108,7 @@ func (q *Queries) CreateSingleReminder(
 		rm.EventUID,
 		rm.AccountID,
 		rm.OffsetSeconds,
-		rm.Metadata,
+		metadata,
 	).Scan(
 		&reminder.ReminderUID,
 		&reminder.EventUID,
@@ -102,6 +153,12 @@ func (q *Queries) CreateSeriesReminder(
 	ctx context.Context,
 	rm *event.Reminder,
 ) (uuid.UUID, int, error) {
+	// metadata is NOT NULL in DB, use empty object if nil
+	metadata := rm.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+
 	groupID := uuid.New()
 
 	query := `
@@ -153,7 +210,7 @@ func (q *Queries) CreateSeriesReminder(
 		rm.AccountID,
 		groupID,
 		rm.OffsetSeconds,
-		rm.Metadata,
+		metadata,
 	)
 	if err != nil {
 		return uuid.Nil, 0, err
@@ -220,7 +277,8 @@ func (q *Queries) UpdateSeriesReminder(
 			)
 	`
 
-	result, err := q.pool.DB().ExecContext(ctx, query, rm.ReminderUID, rm.OffsetSeconds, rm.Metadata)
+	result, err := q.pool.DB().
+		ExecContext(ctx, query, rm.ReminderUID, rm.OffsetSeconds, rm.Metadata)
 	if err != nil {
 		return 0, err
 	}
@@ -304,50 +362,19 @@ func (q *Queries) GetEventReminders(
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logger.Error("failed to close rows: %v", closeErr)
+		}
+	}()
 
 	reminders := make([]*event.Reminder, 0)
 	for rows.Next() {
-		var r event.Reminder
-		var masterEventUID, reminderGroupID, deliveredTs, archivedTs sql.NullString
-
-		err := rows.Scan(
-			&r.ReminderUID,
-			&r.EventUID,
-			&r.AccountID,
-			&masterEventUID,
-			&reminderGroupID,
-			&r.OffsetSeconds,
-			&r.Metadata,
-			&r.IsDelivered,
-			&deliveredTs,
-			&r.CreatedTs,
-			&r.Archived,
-			&archivedTs,
-		)
+		r, err := scanReminderRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		// Handle nullable fields
-		if masterEventUID.Valid {
-			uid, _ := uuid.Parse(masterEventUID.String)
-			r.MasterEventUID = &uid
-		}
-		if reminderGroupID.Valid {
-			uid, _ := uuid.Parse(reminderGroupID.String)
-			r.ReminderGroupID = &uid
-		}
-		if deliveredTs.Valid {
-			ts, _ := strconv.ParseInt(deliveredTs.String, 10, 64)
-			r.DeliveredTs = &ts
-		}
-		if archivedTs.Valid {
-			ts, _ := strconv.ParseInt(archivedTs.String, 10, 64)
-			r.ArchivedTs = &ts
-		}
-
-		reminders = append(reminders, &r)
+		reminders = append(reminders, r)
 	}
 
 	return reminders, rows.Err()
@@ -391,7 +418,10 @@ func (q *Queries) CopyRemindersToNewEvent(
 }
 
 // GetReminderByUID retrieves a single reminder by its UID
-func (q *Queries) GetReminderByUID(ctx context.Context, reminderUID uuid.UUID) (*event.Reminder, error) {
+func (q *Queries) GetReminderByUID(
+	ctx context.Context,
+	reminderUID uuid.UUID,
+) (*event.Reminder, error) {
 	query := `
 		SELECT 
 			reminder_uid, event_uid, account_id, master_event_uid,
@@ -401,46 +431,8 @@ func (q *Queries) GetReminderByUID(ctx context.Context, reminderUID uuid.UUID) (
 		WHERE reminder_uid = $1
 	`
 
-	var r event.Reminder
-	var masterEventUID, reminderGroupID, deliveredTs, archivedTs sql.NullString
-
-	err := q.pool.DB().QueryRowContext(ctx, query, reminderUID).Scan(
-		&r.ReminderUID,
-		&r.EventUID,
-		&r.AccountID,
-		&masterEventUID,
-		&reminderGroupID,
-		&r.OffsetSeconds,
-		&r.Metadata,
-		&r.IsDelivered,
-		&deliveredTs,
-		&r.CreatedTs,
-		&r.Archived,
-		&archivedTs,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// Handle nullable fields
-	if masterEventUID.Valid {
-		uid, _ := uuid.Parse(masterEventUID.String)
-		r.MasterEventUID = &uid
-	}
-	if reminderGroupID.Valid {
-		uid, _ := uuid.Parse(reminderGroupID.String)
-		r.ReminderGroupID = &uid
-	}
-	if deliveredTs.Valid {
-		ts, _ := strconv.ParseInt(deliveredTs.String, 10, 64)
-		r.DeliveredTs = &ts
-	}
-	if archivedTs.Valid {
-		ts, _ := strconv.ParseInt(archivedTs.String, 10, 64)
-		r.ArchivedTs = &ts
-	}
-
-	return &r, nil
+	row := q.pool.DB().QueryRowContext(ctx, query, reminderUID)
+	return scanReminderRow(row)
 }
 
 // MarkReminderDelivered marks a reminder as delivered
@@ -490,7 +482,11 @@ func (q *Queries) GetDueRemindersWithEvents(
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logger.Error("failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var results []*event.ReminderWithEvent
 	for rows.Next() {
@@ -572,51 +568,52 @@ func (q *Queries) GetDueReminders(
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logger.Error("failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var reminders []*event.Reminder
 	for rows.Next() {
-		var r event.Reminder
-		var masterEventUID, reminderGroupID, deliveredTs, archivedTs sql.NullString
-
-		err := rows.Scan(
-			&r.ReminderUID,
-			&r.EventUID,
-			&r.AccountID,
-			&masterEventUID,
-			&reminderGroupID,
-			&r.OffsetSeconds,
-			&r.Metadata,
-			&r.IsDelivered,
-			&deliveredTs,
-			&r.CreatedTs,
-			&r.Archived,
-			&archivedTs,
-		)
+		r, err := scanReminderRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		// Handle nullable fields
-		if masterEventUID.Valid {
-			uid, _ := uuid.Parse(masterEventUID.String)
-			r.MasterEventUID = &uid
-		}
-		if reminderGroupID.Valid {
-			uid, _ := uuid.Parse(reminderGroupID.String)
-			r.ReminderGroupID = &uid
-		}
-		if deliveredTs.Valid {
-			ts, _ := strconv.ParseInt(deliveredTs.String, 10, 64)
-			r.DeliveredTs = &ts
-		}
-		if archivedTs.Valid {
-			ts, _ := strconv.ParseInt(archivedTs.String, 10, 64)
-			r.ArchivedTs = &ts
-		}
-
-		reminders = append(reminders, &r)
+		reminders = append(reminders, r)
 	}
 
 	return reminders, rows.Err()
+}
+
+// CreateSingleReminderTx creates a single reminder within a transaction
+func (q *Queries) CreateSingleReminderTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	rm *event.Reminder,
+) error {
+	query := `
+		INSERT INTO calendar_event_reminders (
+			reminder_uid, event_uid, account_id, master_event_uid,
+			reminder_group_id, offset_seconds, metadata, created_ts, archived
+		)
+		VALUES ($1, $2, $3, NULL, NULL, $4, $5, $6, false)
+	`
+
+	// metadata is NOT NULL in DB, use empty object if nil
+	metadata := rm.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+
+	_, err := tx.ExecContext(ctx, query,
+		rm.ReminderUID,
+		rm.EventUID,
+		rm.AccountID,
+		rm.OffsetSeconds,
+		metadata,
+		rm.CreatedTs,
+	)
+
+	return err
 }

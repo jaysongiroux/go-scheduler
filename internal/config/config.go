@@ -36,6 +36,12 @@ type Config struct {
 	// Reminder trigger worker config
 	ReminderPollInterval time.Duration // How often to poll for reminders
 	ReminderBatchSize    int           // How many reminders to process at once
+
+	// ICS sync worker config
+	IcsSyncInterval   time.Duration // How often to check for calendars needing sync
+	IcsSyncBatchSize  int           // How many calendars to process per batch
+	IcsRequestTimeout time.Duration // Timeout for fetching ICS feeds
+	IcsEncryptionKey  []byte        // 32-byte key for encrypting credentials
 }
 
 const (
@@ -61,6 +67,11 @@ const (
 	// Reminder trigger worker defaults
 	defaultReminderPollInterval = 1 * time.Second
 	defaultReminderBatchSize    = 100
+
+	// ICS sync worker defaults
+	defaultIcsSyncInterval   = 1 * time.Hour
+	defaultIcsSyncBatchSize  = 100
+	defaultIcsRequestTimeout = 30 * time.Second
 )
 
 func getNumberFromEnv(envVar string, defaultValue int) int {
@@ -129,13 +140,39 @@ func Load() (*Config, error) {
 	)
 	webhookMaxRetries := getNumberFromEnv("WEBHOOK_MAX_RETRIES", defaultWebhookMaxRetries)
 
-	webhookTimeoutSeconds := getNumberFromEnv("WEBHOOK_TIMEOUT_SECONDS", defaultWebhookTimeoutSeconds)
+	webhookTimeoutSeconds := getNumberFromEnv(
+		"WEBHOOK_TIMEOUT_SECONDS",
+		defaultWebhookTimeoutSeconds,
+	)
 	webhookMaxBatchSize := getNumberFromEnv("WEBHOOK_MAX_BATCH_SIZE", defaultWebhookMaxBatchSize)
 	defaultPageSize := getNumberFromEnv("DEFAULT_PAGE_SIZE", defaultDefaultPageSize)
 
 	// Reminder trigger worker config
-	reminderPollInterval := getDurationFromEnv("REMINDER_POLL_INTERVAL", defaultReminderPollInterval)
+	reminderPollInterval := getDurationFromEnv(
+		"REMINDER_POLL_INTERVAL",
+		defaultReminderPollInterval,
+	)
 	reminderBatchSize := getNumberFromEnv("REMINDER_BATCH_SIZE", defaultReminderBatchSize)
+
+	// ICS sync worker config
+	icsSyncInterval := getDurationFromEnv("ICS_SYNC_INTERVAL", defaultIcsSyncInterval)
+	icsSyncBatchSize := getNumberFromEnv("ICS_SYNC_BATCH_SIZE", defaultIcsSyncBatchSize)
+	icsRequestTimeout := getDurationFromEnv("ICS_REQUEST_TIMEOUT", defaultIcsRequestTimeout)
+
+	// Load ICS encryption key (must be 32 bytes for AES-256)
+	icsEncryptionKeyStr := os.Getenv("ICS_ENCRYPTION_KEY")
+	var icsEncryptionKey []byte
+	if icsEncryptionKeyStr != "" {
+		icsEncryptionKey = []byte(icsEncryptionKeyStr)
+		if len(icsEncryptionKey) != 32 {
+			logger.Fatal(
+				"ICS_ENCRYPTION_KEY must be exactly 32 bytes (got %d bytes)",
+				len(icsEncryptionKey),
+			)
+		}
+	} else {
+		logger.Fatal("ICS_ENCRYPTION_KEY is not set")
+	}
 
 	cfg := &Config{
 		DatabaseURL:      databaseURL,
@@ -163,6 +200,12 @@ func Load() (*Config, error) {
 		// Reminder trigger worker
 		ReminderPollInterval: reminderPollInterval,
 		ReminderBatchSize:    reminderBatchSize,
+
+		// ICS sync worker
+		IcsSyncInterval:   icsSyncInterval,
+		IcsSyncBatchSize:  icsSyncBatchSize,
+		IcsRequestTimeout: icsRequestTimeout,
+		IcsEncryptionKey:  icsEncryptionKey,
 	}
 	return cfg, nil
 }

@@ -32,20 +32,28 @@ const (
 	EventReminder WebhookEventType = "event.reminder"
 
 	// calendar
-	CalendarCreated WebhookEventType = "calendar.created"
-	CalendarUpdated WebhookEventType = "calendar.updated"
-	CalendarDeleted WebhookEventType = "calendar.deleted"
+	CalendarCreated  WebhookEventType = "calendar.created"
+	CalendarUpdated  WebhookEventType = "calendar.updated"
+	CalendarDeleted  WebhookEventType = "calendar.deleted"
+	CalendarSynced   WebhookEventType = "calendar.synced"
+	CalendarResynced WebhookEventType = "calendar.resynced"
 
-	// account
-	AccountCreated WebhookEventType = "account.created"
-	AccountUpdated WebhookEventType = "account.updated"
-	AccountDeleted WebhookEventType = "account.deleted"
+	// calendar member
+	MemberInvited  WebhookEventType = "member.invited"
+	MemberAccepted WebhookEventType = "member.accepted"
+	MemberRejected WebhookEventType = "member.rejected"
+	MemberRemoved  WebhookEventType = "member.removed"
 
 	// reminder
 	ReminderCreated   WebhookEventType = "reminder.created"
 	ReminderUpdated   WebhookEventType = "reminder.updated"
 	ReminderDeleted   WebhookEventType = "reminder.deleted"
 	ReminderTriggered WebhookEventType = "reminder.triggered"
+
+	// attendee
+	AttendeeCreated WebhookEventType = "attendee.created"
+	AttendeeUpdated WebhookEventType = "attendee.updated"
+	AttendeeDeleted WebhookEventType = "attendee.deleted"
 )
 
 // WebhookPayload represents the payload sent to webhook endpoints
@@ -169,10 +177,20 @@ func (d *WebhookDispatcher) QueueDelivery(
 			CreatedTs:     now,
 		}
 
-		logger.Debug("Creating webhook job %s for webhook %s (URL: %s)", job.JobUID, wh.WebhookUID, wh.URL)
+		logger.Debug(
+			"Creating webhook job %s for webhook %s (URL: %s)",
+			job.JobUID,
+			wh.WebhookUID,
+			wh.URL,
+		)
 
 		if err := d.webhookRepo.CreateWebhookJob(ctx, job); err != nil {
-			logger.Error("Failed to create webhook job %s for webhook %s: %v", job.JobUID, wh.WebhookUID, err)
+			logger.Error(
+				"Failed to create webhook job %s for webhook %s: %v",
+				job.JobUID,
+				wh.WebhookUID,
+				err,
+			)
 			continue
 		}
 
@@ -180,7 +198,12 @@ func (d *WebhookDispatcher) QueueDelivery(
 		logger.Info("Created webhook job %s for webhook %s", job.JobUID, wh.WebhookUID)
 	}
 
-	logger.Info("Successfully created %d/%d webhook job(s) for event type %s", jobsCreated, len(webhooks), eventType)
+	logger.Info(
+		"Successfully created %d/%d webhook job(s) for event type %s",
+		jobsCreated,
+		len(webhooks),
+		eventType,
+	)
 	return nil
 }
 
@@ -355,7 +378,9 @@ func (w *WebhookWorker) processJob(ctx context.Context, job *webhook.WebhookJob)
 	if err != nil {
 		logger.Error("Failed to get webhook %s for job %s: %v", job.WebhookUID, job.JobUID, err)
 		errMsg := err.Error()
-		w.webhookRepo.UpdateWebhookJobStatus(ctx, job.JobUID, webhook.JobStatusFailed, &errMsg)
+		if updateErr := w.webhookRepo.UpdateWebhookJobStatus(ctx, job.JobUID, webhook.JobStatusFailed, &errMsg); updateErr != nil {
+			logger.Error("Failed to update job status to failed: %v", updateErr)
+		}
 		return
 	}
 
@@ -456,7 +481,8 @@ func (w *WebhookWorker) deliverWebhook(
 		Timeout: time.Duration(wh.TimeoutSeconds) * time.Second,
 	}
 
-	// Execute request
+	// Execute request; URL is from stored webhook config, not user input at request time
+	// #nosec G704
 	resp, err := client.Do(req)
 	duration := time.Since(startTime)
 
@@ -464,13 +490,22 @@ func (w *WebhookWorker) deliverWebhook(
 		logger.Error("← Webhook request failed for job %s after %v: %v", job.JobUID, duration, err)
 		return false, 0, fmt.Sprintf("request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			logger.Error("failed to close response body: %v", closeErr)
+		}
+	}()
 
 	logger.Debug("← Received response HTTP %d from %s in %v", resp.StatusCode, wh.URL, duration)
 
 	// Check status code
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		logger.Info("Webhook delivered successfully to %s (HTTP %d) in %v", wh.URL, resp.StatusCode, duration)
+		logger.Info(
+			"Webhook delivered successfully to %s (HTTP %d) in %v",
+			wh.URL,
+			resp.StatusCode,
+			duration,
+		)
 		return true, resp.StatusCode, ""
 	}
 
@@ -573,18 +608,4 @@ func (w *WebhookWorker) staleJobChecker(ctx context.Context) {
 			}
 		}
 	}
-}
-
-type bytesReaderImpl struct {
-	data []byte
-	pos  int
-}
-
-func (r *bytesReaderImpl) Read(p []byte) (n int, err error) {
-	if r.pos >= len(r.data) {
-		return 0, io.EOF
-	}
-	n = copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
 }

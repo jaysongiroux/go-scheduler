@@ -1,10 +1,7 @@
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { createEvent, getCalendarEvents, getEvent } from "../helpers/event";
-import { createAccount, deleteAccount } from "../helpers/account";
+import { beforeAll, describe, expect, test } from "vitest";
+import { createEvent, getCalendarEvents } from "../helpers/event";
 import { createCalendar } from "../helpers/calendar";
 import {
-  AccountObject,
-  SuccessObject,
   ErrorObject,
   EventObject,
   CalendarObject,
@@ -19,49 +16,31 @@ import {
 } from "../helpers/reminder";
 
 const setup = async () => {
-  let account: AccountObject;
+  let accountId: string = crypto.randomUUID();
   let calendar: CalendarObject;
 
-  const accountUUID = crypto.randomUUID();
-  const response = (await createAccount({
-    accountId: accountUUID,
-  })) as AccountObject;
-  expect(response.account_id).toBe(accountUUID);
-  account = response;
-
   const calendarResponse = (await createCalendar({
-    accountId: accountUUID,
+    accountId: accountId,
   })) as CalendarObject;
   expect(calendarResponse.calendar_uid).toBeDefined();
-  expect(calendarResponse.account_id).toBe(accountUUID);
+  expect(calendarResponse.account_id).toBe(accountId);
   calendar = calendarResponse;
 
-  return { account, calendar };
-};
-
-const deleteAllRemindersOnEvent = async (event: EventObject) => {
-  const reminders = event.reminders || [];
-  for (const reminder of reminders) {
-    const resp = await deleteReminder({
-      reminderUid: reminder.reminder_uid,
-      eventUid: event.event_uid,
-      scope: "single",
-    });
-    expect(resp.success).toBeTruthy();
-  }
+  return { accountId, calendar };
 };
 
 describe("Reminder API - single event", () => {
-  let account: AccountObject;
+  let accountId: string;
   let calendar: CalendarObject;
   let event: EventObject;
 
   beforeAll(async () => {
-    const { account: accountData, calendar: calendarData } = await setup();
-    account = accountData;
+    const { accountId: accountIdData, calendar: calendarData } = await setup();
+    accountId = accountIdData;
     calendar = calendarData;
 
     const createdEvent = (await createEvent({
+      accountId,
       calendarUid: calendar.calendar_uid,
       startTs: Math.floor(Date.now() / 1000) + 3600,
       endTs: Math.floor(Date.now() / 1000) + 7200,
@@ -71,25 +50,17 @@ describe("Reminder API - single event", () => {
     event = createdEvent;
   });
 
-  afterAll(async () => {
-    // deleting accounts will cascade to delete calendars and events
-    const response = (await deleteAccount({
-      accountId: account.account_id,
-    })) as SuccessObject;
-    expect(response.success).toBe(true);
-  });
-
   test("Should be able to create a reminder for a single event with no scope", async () => {
     const response = (await createReminder({
       metadata: {},
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -900, // 15 minutes before (negative)
     })) as any;
 
     expect(response.reminder).toBeDefined();
     expect(response.reminder.reminder_uid).toBeDefined();
-    expect(response.reminder.account_id).toBe(account.account_id);
+    expect(response.reminder.account_id).toBe(accountId);
     expect(response.reminder.offset_seconds).toBe(-900);
     expect(response.reminder.metadata).toBeDefined();
     expect(response.reminder.is_delivered).toBe(false);
@@ -107,7 +78,7 @@ describe("Reminder API - single event", () => {
   test("Should not be able to create a reminder with positive offset_seconds", async () => {
     const response = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: 120, // Positive (invalid)
     })) as ErrorObject;
 
@@ -119,14 +90,14 @@ describe("Reminder API - single event", () => {
   test("Should be able to update a reminder successfully", async () => {
     const createResponse = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -600, // 10 minutes before
       metadata: { title: "Test Event" },
       scope: "single",
     })) as any;
 
     expect(createResponse.reminder.reminder_uid).toBeDefined();
-    expect(createResponse.reminder.account_id).toBe(account.account_id);
+    expect(createResponse.reminder.account_id).toBe(accountId);
     expect(createResponse.reminder.offset_seconds).toBe(-600);
     expect(createResponse.reminder.metadata).toEqual({ title: "Test Event" });
     expect(createResponse.reminder.is_delivered).toBe(false);
@@ -140,7 +111,7 @@ describe("Reminder API - single event", () => {
     })) as any;
 
     expect(updateResponse.reminder.reminder_uid).toBeDefined();
-    expect(updateResponse.reminder.account_id).toBe(account.account_id);
+    expect(updateResponse.reminder.account_id).toBe(accountId);
     expect(updateResponse.reminder.offset_seconds).toBe(-1800);
     expect(updateResponse.reminder.metadata).toEqual({
       title: "Updated Test Event",
@@ -161,9 +132,7 @@ describe("Reminder API - single event", () => {
         (r) => r.reminder_uid === updateResponse.reminder.reminder_uid
       )
     ).toBe(true);
-    expect(reminders.some((r) => r.account_id === account.account_id)).toBe(
-      true
-    );
+    expect(reminders.some((r) => r.account_id === accountId)).toBe(true);
     expect(reminders.some((r) => r.offset_seconds === -1800)).toBe(true);
     expect(
       reminders.some((r) => r.metadata.title === "Updated Test Event")
@@ -182,7 +151,7 @@ describe("Reminder API - single event", () => {
     // Create a reminder first
     const createResponse = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -300, // 5 minutes before
       scope: "single",
     })) as any;
@@ -226,18 +195,19 @@ describe("Reminder API - single event", () => {
 });
 
 describe("Reminder API - recurring event", () => {
-  let account: AccountObject;
+  let accountId: string;
   let calendar: CalendarObject;
   let event: EventObject;
 
   beforeAll(async () => {
-    const { account: accountData, calendar: calendarData } = await setup();
-    account = accountData;
+    const { accountId: accountIdData, calendar: calendarData } = await setup();
+    accountId = accountIdData;
     calendar = calendarData;
 
     const createdEvent = (await createEvent({
       calendarUid: calendar.calendar_uid,
       startTs: Math.floor(Date.now() / 1000) + 3600,
+      accountId,
       endTs: Math.floor(Date.now() / 1000) + 7200,
       metadata: { title: "Test Recurring Event" },
       recurrence: { rule: "FREQ=DAILY;COUNT=10" },
@@ -246,18 +216,10 @@ describe("Reminder API - recurring event", () => {
     event = createdEvent;
   });
 
-  afterAll(async () => {
-    // deleting accounts will cascade to delete calendars and events
-    const response = (await deleteAccount({
-      accountId: account.account_id,
-    })) as SuccessObject;
-    expect(response.success).toBe(true);
-  });
-
   test("Should not be able to create a reminder if a scope is not provided for a recurring event", async () => {
     const response = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -600,
     })) as ErrorObject;
 
@@ -269,13 +231,13 @@ describe("Reminder API - recurring event", () => {
   test("Should be able to create a reminder for a recurring event with a single scope", async () => {
     const response = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -900, // 15 minutes before
       scope: "single",
     })) as any;
 
     expect(response.reminder.reminder_uid).toBeDefined();
-    expect(response.reminder.account_id).toBe(account.account_id);
+    expect(response.reminder.account_id).toBe(accountId);
     expect(response.reminder.offset_seconds).toBe(-900);
     expect(response.scope).toBe("single");
     expect(response.count).toBe(1);
@@ -306,14 +268,14 @@ describe("Reminder API - recurring event", () => {
     // Create a reminder for the master event and all instances
     const response = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -1200, // 20 minutes before
       scope: "all",
       metadata: { title: "Should be on all event instances" },
     })) as any;
 
     expect(response.reminder).toBeDefined();
-    expect(response.reminder.account_id).toBe(account.account_id);
+    expect(response.reminder.account_id).toBe(accountId);
     expect(response.reminder.reminder_group_id).toBeDefined(); // All scope creates a group
     expect(response.scope).toBe("all");
     expect(response.count).toBeGreaterThan(1); // Master + instances
@@ -332,7 +294,7 @@ describe("Reminder API - recurring event", () => {
 
     // Get a future instance and verify it has the reminder
     const calendarEvents = (await getCalendarEvents({
-      calendarUid: calendar.calendar_uid,
+      calendarUids: calendar.calendar_uid,
       startTs: event.start_ts + 86400,
       endTs: event.start_ts + 86400 * 2,
     })) as GenericPagedResponse<EventObject>;
@@ -371,7 +333,7 @@ describe("Reminder API - recurring event", () => {
     // Create a reminder with 'all' scope first
     const createResponse = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -600,
       scope: "all",
       metadata: { title: "Test reminder" },
@@ -415,7 +377,7 @@ describe("Reminder API - recurring event", () => {
 
     // Get a future instance and verify it still has the reminder
     const futureEvents = (await getCalendarEvents({
-      calendarUid: calendar.calendar_uid,
+      calendarUids: calendar.calendar_uid,
       startTs: event.start_ts + 86400,
       endTs: event.start_ts + 86400 * 2,
     })) as GenericPagedResponse<EventObject>;
@@ -459,7 +421,7 @@ describe("Reminder API - recurring event", () => {
     // Create a reminder for all events
     const createResponse = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -1800,
       scope: "all",
       metadata: { title: "Should be deleted from all" },
@@ -499,7 +461,7 @@ describe("Reminder API - recurring event", () => {
 
     // Verify future instance has no reminders with that group
     const futureEvents = (await getCalendarEvents({
-      calendarUid: calendar.calendar_uid,
+      calendarUids: calendar.calendar_uid,
       startTs: event.start_ts + 86400,
       endTs: event.start_ts + 86400 * 2,
     })) as GenericPagedResponse<EventObject>;
@@ -536,7 +498,7 @@ describe("Reminder API - recurring event", () => {
     // Create a reminder
     const createResponse = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -600,
       scope: "single",
       metadata: { title: "Test Event" },
@@ -591,7 +553,7 @@ describe("Reminder API - recurring event", () => {
     // Create a reminder with 'all' scope
     const createResponse = (await createReminder({
       eventUid: event.event_uid,
-      accountId: account.account_id,
+      accountId: accountId,
       offsetSeconds: -900,
       scope: "all",
       metadata: { title: "Original" },
@@ -637,7 +599,7 @@ describe("Reminder API - recurring event", () => {
 
     // Verify future instance has updated reminder
     const futureEvents = (await getCalendarEvents({
-      calendarUid: calendar.calendar_uid,
+      calendarUids: calendar.calendar_uid,
       startTs: event.start_ts + 86400,
       endTs: event.start_ts + 86400 * 2,
     })) as GenericPagedResponse<EventObject>;

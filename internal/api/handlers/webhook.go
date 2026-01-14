@@ -23,8 +23,18 @@ func (h *Handler) CreateWebhook(w http.ResponseWriter, r *http.Request) {
 		wh.WebhookUID = uuid.New()
 	}
 	if wh.Secret == "" {
-		// TODO: generate a secure secret
-		wh.Secret = uuid.New().String()
+		secret, err := webhook.GenerateWebhookSecret()
+		if err != nil {
+			web.RespondError(
+				w,
+				http.StatusInternalServerError,
+				"Failed to generate webhook secret",
+				err.Error(),
+			)
+			return
+		}
+
+		wh.Secret = secret
 	}
 
 	// handle if event types is empty by setting it to an empty array
@@ -71,7 +81,7 @@ func (h *Handler) GetWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetWebhookEndpoints(w http.ResponseWriter, r *http.Request) {
-	err, limitInt, offsetInt := ExtractLimitOffset(r, h.Config)
+	limitInt, offsetInt, err := ExtractLimitOffset(r, h.Config)
 	if err != nil {
 		web.RespondError(w, http.StatusBadRequest, "Invalid limit or offset", err.Error())
 		return
@@ -80,11 +90,27 @@ func (h *Handler) GetWebhookEndpoints(w http.ResponseWriter, r *http.Request) {
 	webhookEndpoints, err := h.WebhookRepo.GetWebhookEndpoints(r.Context(), offsetInt, limitInt)
 	if err != nil {
 		logger.Error("Failed to get webhook endpoints: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to get webhook endpoints", err.Error())
+		web.RespondError(
+			w,
+			http.StatusInternalServerError,
+			"Failed to get webhook endpoints",
+			err.Error(),
+		)
 		return
 	}
 
 	web.ResponsePagedResults(w, webhookEndpoints, len(webhookEndpoints), limitInt, offsetInt)
+}
+
+// UpdateWebhookRequest is used to parse partial updates for webhooks
+type UpdateWebhookRequest struct {
+	URL            *string  `json:"url,omitempty"`
+	EventTypes     []string `json:"event_types,omitempty"`
+	IsActive       *bool    `json:"is_active,omitempty"`
+	RetryCount     *int     `json:"retry_count,omitempty"`
+	TimeoutSeconds *int     `json:"timeout_seconds,omitempty"`
+	// #nosec G117 -- webhook signing secret by design; not updatable but we check for it
+	Secret string `json:"secret,omitempty"`
 }
 
 func (h *Handler) UpdateWebhook(w http.ResponseWriter, r *http.Request) {
@@ -95,21 +121,19 @@ func (h *Handler) UpdateWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var wh webhook.Webhook
-	if err := json.NewDecoder(r.Body).Decode(&wh); err != nil {
+	var req UpdateWebhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		logger.Error("Failed to decode request body: %v", err)
 		web.RespondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
 
-	if wh.Secret != "" {
+	if req.Secret != "" {
 		web.RespondError(w, http.StatusBadRequest, "Cannot update secret")
 		return
 	}
 
-	wh.WebhookUID = webhookUID
-
-	// check if webhook exists
+	// Get existing webhook
 	existingWh, err := h.WebhookRepo.GetWebhook(r.Context(), webhookUID)
 	if err != nil {
 		logger.Error("Failed to get webhook: %v", err)
@@ -117,23 +141,46 @@ func (h *Handler) UpdateWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// handle if event types is empty by setting it to an empty array
-	if wh.EventTypes == nil {
-		wh.EventTypes = []string{}
+	// Build updated webhook by merging with existing values
+	wh := webhook.Webhook{
+		WebhookUID:     webhookUID,
+		URL:            existingWh.URL,
+		EventTypes:     existingWh.EventTypes,
+		IsActive:       existingWh.IsActive,
+		RetryCount:     existingWh.RetryCount,
+		TimeoutSeconds: existingWh.TimeoutSeconds,
+		Secret:         existingWh.Secret,
+		CreatedTs:      existingWh.CreatedTs,
+		FailureCount:   existingWh.FailureCount,
+		UpdatedTs:      time.Now().UTC().Unix(),
 	}
 
-	if wh.RetryCount < 0 {
-		logger.Info("Setting retry count to %v", h.Config.WebhookMaxRetries)
-		wh.RetryCount = h.Config.WebhookMaxRetries
+	// Apply updates from request
+	if req.URL != nil {
+		wh.URL = *req.URL
 	}
-	if wh.TimeoutSeconds < 0 {
-		logger.Info("Setting timeout seconds to %v", h.Config.WebhookTimeoutSeconds)
-		wh.TimeoutSeconds = h.Config.WebhookTimeoutSeconds
+	if req.EventTypes != nil {
+		wh.EventTypes = req.EventTypes
 	}
-
-	wh.UpdatedTs = time.Now().UTC().Unix()
-	wh.CreatedTs = existingWh.CreatedTs
-	wh.FailureCount = existingWh.FailureCount
+	if req.IsActive != nil {
+		wh.IsActive = *req.IsActive
+	}
+	if req.RetryCount != nil {
+		if *req.RetryCount < 0 {
+			logger.Info("Setting retry count to %v", h.Config.WebhookMaxRetries)
+			wh.RetryCount = h.Config.WebhookMaxRetries
+		} else {
+			wh.RetryCount = *req.RetryCount
+		}
+	}
+	if req.TimeoutSeconds != nil {
+		if *req.TimeoutSeconds <= 0 {
+			logger.Info("Setting timeout seconds to %v", h.Config.WebhookTimeoutSeconds)
+			wh.TimeoutSeconds = h.Config.WebhookTimeoutSeconds
+		} else {
+			wh.TimeoutSeconds = *req.TimeoutSeconds
+		}
+	}
 
 	if err := h.WebhookRepo.UpdateWebhook(r.Context(), &wh); err != nil {
 		logger.Error("Failed to update webhook: %v", err)
@@ -144,7 +191,12 @@ func (h *Handler) UpdateWebhook(w http.ResponseWriter, r *http.Request) {
 	updatedwh, err := h.WebhookRepo.GetWebhook(r.Context(), webhookUID)
 	if err != nil {
 		logger.Error("Failed to get updated webhook: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to get updated webhook", err.Error())
+		web.RespondError(
+			w,
+			http.StatusInternalServerError,
+			"Failed to get updated webhook",
+			err.Error(),
+		)
 		return
 	}
 
@@ -176,16 +228,26 @@ func (h *Handler) GetWebhookDeliveries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err, limitInt, offsetInt := ExtractLimitOffset(r, h.Config)
+	limitInt, offsetInt, err := ExtractLimitOffset(r, h.Config)
 	if err != nil {
 		web.RespondError(w, http.StatusBadRequest, "Invalid limit or offset", err.Error())
 		return
 	}
 
-	deliveries, err := h.WebhookRepo.GetWebhookDeliveries(r.Context(), webhookUID, limitInt, offsetInt)
+	deliveries, err := h.WebhookRepo.GetWebhookDeliveries(
+		r.Context(),
+		webhookUID,
+		limitInt,
+		offsetInt,
+	)
 	if err != nil {
 		logger.Error("Failed to get webhook deliveries: %v", err)
-		web.RespondError(w, http.StatusInternalServerError, "Failed to get webhook deliveries", err.Error())
+		web.RespondError(
+			w,
+			http.StatusInternalServerError,
+			"Failed to get webhook deliveries",
+			err.Error(),
+		)
 		return
 	}
 

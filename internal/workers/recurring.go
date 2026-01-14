@@ -7,7 +7,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jaysongiroux/go-scheduler/internal/config"
+	"github.com/jaysongiroux/go-scheduler/internal/db/services/attendee"
 	"github.com/jaysongiroux/go-scheduler/internal/db/services/event"
+	reminders "github.com/jaysongiroux/go-scheduler/internal/db/services/reminders"
 	"github.com/jaysongiroux/go-scheduler/internal/logger"
 	rr "github.com/teambition/rrule-go"
 )
@@ -20,6 +22,8 @@ var newUUID = uuid.New
 // RecurringWorker handles background generation of recurring event instances
 type RecurringWorker struct {
 	eventRepo         *event.Queries
+	reminderRepo      *reminders.Queries
+	attendeeRepo      *attendee.Queries
 	webhookDispatcher *WebhookDispatcher
 	config            *config.Config
 	stopCh            chan struct{}
@@ -27,9 +31,17 @@ type RecurringWorker struct {
 }
 
 // NewRecurringWorker creates a new recurring event generation worker
-func NewRecurringWorker(eventRepo *event.Queries, webhookDispatcher *WebhookDispatcher, cfg *config.Config) *RecurringWorker {
+func NewRecurringWorker(
+	eventRepo *event.Queries,
+	reminderRepo *reminders.Queries,
+	attendeeRepo *attendee.Queries,
+	webhookDispatcher *WebhookDispatcher,
+	cfg *config.Config,
+) *RecurringWorker {
 	return &RecurringWorker{
 		eventRepo:         eventRepo,
+		reminderRepo:      reminderRepo,
+		attendeeRepo:      attendeeRepo,
 		webhookDispatcher: webhookDispatcher,
 		config:            cfg,
 		stopCh:            make(chan struct{}),
@@ -187,6 +199,62 @@ func (w *RecurringWorker) generateInstancesForEvent(
 		return 0, err
 	}
 
+	// Copy attendees and reminders for each generated instance
+	totalAttendeesCopied := 0
+	totalRemindersCopied := 0
+	for _, inst := range instances {
+		// Copy attendees from master to instance
+		if w.attendeeRepo != nil {
+			attendeeCount, err := w.attendeeRepo.CopyAttendeesToNewEvent(
+				ctx,
+				master.EventUID,
+				inst.EventUID,
+			)
+			if err != nil {
+				logger.Warn(
+					"Recurring worker: failed to copy attendees for instance %s: %v",
+					inst.EventUID,
+					err,
+				)
+			} else {
+				totalAttendeesCopied += attendeeCount
+			}
+		}
+
+		// Copy reminders from master to instance
+		if w.reminderRepo != nil {
+			reminderCount, err := w.reminderRepo.CopyRemindersToNewEvent(
+				ctx,
+				master.EventUID,
+				inst.EventUID,
+			)
+			if err != nil {
+				logger.Warn(
+					"Recurring worker: failed to copy reminders for instance %s: %v",
+					inst.EventUID,
+					err,
+				)
+			} else {
+				totalRemindersCopied += reminderCount
+			}
+		}
+	}
+
+	if totalAttendeesCopied > 0 {
+		logger.Debug(
+			"Recurring worker: copied %d attendees for %d instances",
+			totalAttendeesCopied,
+			len(instances),
+		)
+	}
+	if totalRemindersCopied > 0 {
+		logger.Debug(
+			"Recurring worker: copied %d reminders for %d instances",
+			totalRemindersCopied,
+			len(instances),
+		)
+	}
+
 	// Queue batch webhook delivery for created instances
 	if w.webhookDispatcher != nil && len(instances) > 0 {
 		batchData := make([]interface{}, len(instances))
@@ -210,7 +278,6 @@ func (w *RecurringWorker) generateInstancesForEvent(
 }
 
 // expandMasterEvent generates instance events from a master event within a time range
-// TODO: Audit this function for correctness and performance
 func (w *RecurringWorker) expandMasterEvent(
 	master *event.Event,
 	startTs, endTs int64,
@@ -244,6 +311,7 @@ func (w *RecurringWorker) calculateRecurrenceStatus(
 
 // generateInstancesInternal creates instance events from a master event within a time range
 // This mirrors the logic in the event repository
+// Uses timezone-aware expansion to correctly handle DST transitions.
 func generateInstancesInternal(master *event.Event, startTs, endTs int64) []*event.Event {
 	if master == nil || master.Recurrence == nil || master.Recurrence.Rule == "" {
 		return nil
@@ -255,15 +323,41 @@ func generateInstancesInternal(master *event.Event, startTs, endTs int64) []*eve
 		return nil
 	}
 
-	opt.Dtstart = time.Unix(master.StartTs, 0).UTC()
+	// Load timezone for DST-aware expansion (default to UTC if not set)
+	loc := time.UTC
+	if master.Timezone != nil && *master.Timezone != "" {
+		loc, err = time.LoadLocation(*master.Timezone)
+		if err != nil {
+			logger.Warn(
+				"Failed to load timezone %s, falling back to UTC: %v",
+				*master.Timezone,
+				err,
+			)
+			loc = time.UTC
+		}
+	}
+
+	// Apply DTSTART in local timezone for DST-aware recurrence expansion
+	if master.LocalStart != nil && *master.LocalStart != "" {
+		localTime, err := time.ParseInLocation("2006-01-02T15:04:05", *master.LocalStart, loc)
+		if err == nil {
+			opt.Dtstart = localTime
+		} else {
+			opt.Dtstart = time.Unix(master.StartTs, 0).In(loc)
+		}
+	} else {
+		opt.Dtstart = time.Unix(master.StartTs, 0).In(loc)
+	}
+
 	r, err := newRRule(*opt)
 	if err != nil {
 		return nil
 	}
 
+	// Expand occurrences in local timezone
 	occurrences := r.Between(
-		time.Unix(startTs, 0).UTC(),
-		time.Unix(endTs, 0).UTC(),
+		time.Unix(startTs, 0).In(loc),
+		time.Unix(endTs, 0).In(loc),
 		true,
 	)
 
@@ -277,11 +371,19 @@ func generateInstancesInternal(master *event.Event, startTs, endTs int64) []*eve
 	instances := make([]*event.Event, 0, len(occurrences))
 
 	for _, occ := range occurrences {
-		occTs := occ.Unix()
+		// Convert occurrence to UTC for storage
+		occTs := occ.UTC().Unix()
 
 		// Skip excluded instances
 		if exDateMap[occTs] {
 			continue
+		}
+
+		// Compute local_start for this occurrence (format in event TZ for DST consistency)
+		var localStart *string
+		if master.Timezone != nil && *master.Timezone != "" {
+			ls := occ.In(loc).Format("2006-01-02T15:04:05")
+			localStart = &ls
 		}
 
 		instance := &event.Event{
@@ -293,6 +395,8 @@ func generateInstancesInternal(master *event.Event, startTs, endTs int64) []*eve
 			EndTs:               occTs + master.Duration,
 			CreatedTs:           now,
 			UpdatedTs:           now,
+			Timezone:            master.Timezone,
+			LocalStart:          localStart,
 			IsRecurringInstance: true,
 			MasterEventUID:      &master.EventUID,
 			OriginalStartTs:     &occTs,

@@ -1,0 +1,51 @@
+# Git files
+.git
+.gitignore
+.gitlab-ci.yml
+
+# Documentation
+README.md
+*.md
+
+# Development files
+.env
+.env.*
+
+# Node modules
+node_modules
+clients/node/node_modules
+e2e/node_modules
+
+# Build artifacts
+bin/
+clients/node/dist
+*.log
+
+# Test files
+e2e/
+*_test.go
+**/*_test.go
+
+# IDE files
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CI/CD
+.github
+
+# Infrastructure
+infra/
+docker-compose.yaml
+docker-compose.yml
+
+# Temporary files
+tmp/
+temp/
+*.tmp

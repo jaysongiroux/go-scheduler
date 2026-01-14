@@ -8,6 +8,10 @@ export type EventObject = {
   created_ts: number;
   updated_ts: number;
 
+  // Timezone support for DST-aware scheduling
+  timezone?: string | null;
+  local_start?: string | null;
+
   // Recurrence tracking
   recurrence?: { rule: string } | null;
   recurrence_status?: "active" | "inactive" | null;
@@ -33,14 +37,6 @@ export type ErrorObject = {
   details: string;
 };
 
-export type AccountObject = {
-  account_id: string;
-  created_ts: number;
-  updated_ts: number;
-  settings?: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-};
-
 export type SuccessObject = {
   success: boolean;
 };
@@ -57,6 +53,29 @@ export type CalendarObject = {
   account_id: string;
   settings?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  is_owner?: boolean;
+  members?: CalendarMemberObject[];
+  // ICS import fields
+  ics_url?: string | null;
+  ics_auth_type?: string | null;
+  ics_last_sync_ts?: number | null;
+  ics_last_sync_status?: string | null;
+  ics_sync_interval_seconds?: number | null;
+  ics_error_message?: string | null;
+  ics_last_etag?: string | null;
+  ics_last_modified?: string | null;
+  is_read_only?: boolean;
+  sync_on_partial_failure?: boolean;
+};
+
+export type CalendarMemberObject = {
+  account_id: string;
+  calendar_uid: string;
+  status: "pending" | "confirmed";
+  role: "read" | "write";
+  invited_by: string;
+  invited_at_ts: number;
+  updated_ts: number;
 };
 
 export type WebhookObject = {
@@ -99,4 +118,53 @@ export type ReminderObject = {
   created_ts: number;
   archived: boolean;
   archived_ts?: number | null;
+};
+
+export type AttendeeObject = {
+  attendee_uid: string;
+  event_uid: string;
+  account_id: string;
+  master_event_uid?: string | null;
+  attendee_group_id?: string | null;
+  role: "organizer" | "attendee";
+  rsvp_status: "pending" | "accepted" | "declined" | "tentative";
+  metadata: Record<string, unknown>;
+  created_ts: number;
+  updated_ts: number;
+  archived: boolean;
+  archived_ts?: number | null;
+};
+
+// ICS Import Types
+export type ICSImportSummary = {
+  total_events: number;
+  imported_events: number;
+  failed_events: number;
+};
+
+export type ICSImportEventResult = {
+  ics_uid: string;
+  event_uid?: string;
+  status: "success" | "failed";
+  error?: string;
+};
+
+export type ICSImportResponse = {
+  calendar: CalendarObject;
+  summary: ICSImportSummary;
+  events: ICSImportEventResult[];
+};
+
+export type ICSLinkImportResponse = {
+  calendar: CalendarObject;
+  summary: ICSImportSummary;
+  events: ICSImportEventResult[];
+  sync_scheduled: boolean;
+};
+
+export type ResyncResponse = {
+  calendar: CalendarObject;
+  imported_events: number;
+  failed_events: number;
+  warnings: string[];
 };

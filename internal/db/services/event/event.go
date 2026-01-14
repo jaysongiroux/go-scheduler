@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +72,12 @@ type Event struct {
 	EndTs       int64     `json:"end_ts"`
 	CreatedTs   int64     `json:"created_ts"`
 	UpdatedTs   int64     `json:"updated_ts"`
+
+	// Timezone support for DST-aware scheduling
+	// Timezone is an IANA timezone string (e.g., "America/New_York")
+	// LocalStart is the wall-clock time in RFC3339 format without timezone offset
+	Timezone   *string `json:"timezone,omitempty"`
+	LocalStart *string `json:"local_start,omitempty"`
 
 	// Recurrence tracking (master event fields)
 	Recurrence       *rrule.Recurrence `json:"recurrence"`
@@ -145,16 +152,17 @@ func (q *Queries) CreateEvent(ctx context.Context, event *Event) (Event, error) 
 	}
 
 	query := `
+		-- CreateEvent ---
 		INSERT INTO calendar_events (
 			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
 			created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts,
 			exdates_ts, is_recurring_instance, master_event_uid, original_start_ts,
-			is_modified, is_cancelled, metadata
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			is_modified, is_cancelled, metadata, timezone, local_start
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		RETURNING event_uid, calendar_uid, account_id, start_ts, duration, end_ts, 
 		          created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts, 
 		          exdates_ts, is_recurring_instance, master_event_uid, original_start_ts, 
-		          is_modified, is_cancelled, metadata
+		          is_modified, is_cancelled, metadata, timezone, local_start
 	`
 
 	// Marshal recurrence to JSON (empty/nil becomes SQL NULL)
@@ -185,6 +193,8 @@ func (q *Queries) CreateEvent(ctx context.Context, event *Event) (Event, error) 
 	var recurrenceEndTsReturned sql.NullInt64
 	var masterEventUIDReturned *uuid.UUID
 	var originalStartTsReturned sql.NullInt64
+	var timezoneReturned sql.NullString
+	var localStartReturned sql.NullString
 
 	err := q.pool.DB().QueryRowContext(ctx, query,
 		event.EventUID,
@@ -205,6 +215,8 @@ func (q *Queries) CreateEvent(ctx context.Context, event *Event) (Event, error) 
 		event.IsModified,
 		event.IsCancelled,
 		metadata,
+		db.ToNullableString(event.Timezone),
+		db.ToNullableString(event.LocalStart),
 	).Scan(
 		&createdEvent.EventUID,
 		&createdEvent.CalendarUID,
@@ -224,6 +236,8 @@ func (q *Queries) CreateEvent(ctx context.Context, event *Event) (Event, error) 
 		&createdEvent.IsModified,
 		&createdEvent.IsCancelled,
 		&createdEvent.Metadata,
+		&timezoneReturned,
+		&localStartReturned,
 	)
 	if err != nil {
 		return Event{}, err
@@ -253,6 +267,12 @@ func (q *Queries) CreateEvent(ctx context.Context, event *Event) (Event, error) 
 	if originalStartTsReturned.Valid {
 		createdEvent.OriginalStartTs = &originalStartTsReturned.Int64
 	}
+	if timezoneReturned.Valid {
+		createdEvent.Timezone = &timezoneReturned.String
+	}
+	if localStartReturned.Valid {
+		createdEvent.LocalStart = &localStartReturned.String
+	}
 
 	// Reminders field is left empty - populate separately if needed
 	createdEvent.Reminders = []Reminder{}
@@ -268,7 +288,7 @@ func (q *Queries) GetEvent(ctx context.Context, eventUID uuid.UUID, _ *bool) (*E
 			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
 			created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts,
 			exdates_ts, is_recurring_instance, master_event_uid, original_start_ts,
-			is_modified, is_cancelled, metadata
+			is_modified, is_cancelled, metadata, timezone, local_start
 		FROM calendar_events
 		WHERE event_uid = $1
 	`
@@ -279,6 +299,8 @@ func (q *Queries) GetEvent(ctx context.Context, eventUID uuid.UUID, _ *bool) (*E
 	var recurrenceEndTs sql.NullInt64
 	var masterEventUID *uuid.UUID
 	var originalStartTs sql.NullInt64
+	var timezone sql.NullString
+	var localStart sql.NullString
 
 	err := q.pool.DB().QueryRowContext(ctx, query, eventUID).Scan(
 		&evt.EventUID,
@@ -299,6 +321,8 @@ func (q *Queries) GetEvent(ctx context.Context, eventUID uuid.UUID, _ *bool) (*E
 		&evt.IsModified,
 		&evt.IsCancelled,
 		&evt.Metadata,
+		&timezone,
+		&localStart,
 	)
 	if err != nil {
 		return nil, err
@@ -328,6 +352,12 @@ func (q *Queries) GetEvent(ctx context.Context, eventUID uuid.UUID, _ *bool) (*E
 	if originalStartTs.Valid {
 		evt.OriginalStartTs = &originalStartTs.Int64
 	}
+	if timezone.Valid {
+		evt.Timezone = &timezone.String
+	}
+	if localStart.Valid {
+		evt.LocalStart = &localStart.String
+	}
 
 	// Reminders field is left empty - populate separately if needed
 	evt.Reminders = []Reminder{}
@@ -335,7 +365,7 @@ func (q *Queries) GetEvent(ctx context.Context, eventUID uuid.UUID, _ *bool) (*E
 	return &evt, nil
 }
 
-// GetCalendarEvents retrieves events for a calendar within a time range.
+// GetCalendarEvents retrieves events for multiple calendars within a time range.
 // Returns both non-recurring events and pre-generated instances within the range.
 // For queries beyond the generation window, falls back to on-demand expansion.
 //
@@ -343,42 +373,62 @@ func (q *Queries) GetEvent(ctx context.Context, eventUID uuid.UUID, _ *bool) (*E
 // Use GetEventReminders() to fetch reminders for specific events.
 func (q *Queries) GetCalendarEvents(
 	ctx context.Context,
-	calendarUID uuid.UUID,
+	calendarUIDs []uuid.UUID,
 	startTs, endTs int64,
 ) ([]*Event, error) {
+	if len(calendarUIDs) == 0 {
+		return []*Event{}, nil
+	}
+
 	var query string
 	var args []interface{}
 
+	// Build the IN clause for calendar UIDs
+	placeholders := make([]string, len(calendarUIDs))
+	args = make([]interface{}, 0, len(calendarUIDs)+2)
+
+	for i, calendarUID := range calendarUIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args = append(args, calendarUID)
+	}
+
+	startTsPlaceholder := fmt.Sprintf("$%d", len(calendarUIDs)+1)
+	endTsPlaceholder := fmt.Sprintf("$%d", len(calendarUIDs)+2)
+	args = append(args, startTs, endTs)
+
 	// Time range provided - get non-recurring events + instances in range
 	// Also fetch master events for potential on-demand expansion
-	query = `
+	query = fmt.Sprintf(`
 		SELECT 
 			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
 			created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts,
 			exdates_ts, is_recurring_instance, master_event_uid, original_start_ts,
-			is_modified, is_cancelled, metadata
+			is_modified, is_cancelled, metadata, timezone, local_start
 		FROM calendar_events
-		WHERE calendar_uid = $1
+		WHERE calendar_uid IN (%s)
 		AND is_cancelled = FALSE
 		AND (
 			-- Non-recurring events in time range
-			(recurrence IS NULL AND is_recurring_instance = FALSE AND end_ts >= $2 AND start_ts <= $3)
+			(recurrence IS NULL AND is_recurring_instance = FALSE AND end_ts >= %s AND start_ts <= %s)
 			OR 
 			-- Pre-generated instances in time range
-			(is_recurring_instance = TRUE AND end_ts >= $2 AND start_ts <= $3)
+			(is_recurring_instance = TRUE AND end_ts >= %s AND start_ts <= %s)
 			OR
 			-- Master events (for potential on-demand expansion beyond generation window)
 			(recurrence IS NOT NULL AND is_recurring_instance = FALSE)
 		)
 		ORDER BY start_ts ASC
-	`
-	args = []any{calendarUID, startTs, endTs}
+	`, strings.Join(placeholders, ","), startTsPlaceholder, endTsPlaceholder, startTsPlaceholder, endTsPlaceholder)
 
 	rows, err := q.pool.DB().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logger.Error("failed to close rows: %v", closeErr)
+		}
+	}()
 
 	allEvents := make([]*Event, 0)
 	masterEvents := make(map[uuid.UUID]*Event)   // Track master events for deduplication
@@ -450,6 +500,8 @@ func (q *Queries) scanEventFromRows(rows *sql.Rows) (*Event, error) {
 	var recurrenceEndTs sql.NullInt64
 	var masterEventUID *uuid.UUID
 	var originalStartTs sql.NullInt64
+	var timezone sql.NullString
+	var localStart sql.NullString
 
 	err := rows.Scan(
 		&evt.EventUID,
@@ -470,6 +522,8 @@ func (q *Queries) scanEventFromRows(rows *sql.Rows) (*Event, error) {
 		&evt.IsModified,
 		&evt.IsCancelled,
 		&evt.Metadata,
+		&timezone,
+		&localStart,
 	)
 	if err != nil {
 		return nil, err
@@ -499,6 +553,12 @@ func (q *Queries) scanEventFromRows(rows *sql.Rows) (*Event, error) {
 	if originalStartTs.Valid {
 		evt.OriginalStartTs = &originalStartTs.Int64
 	}
+	if timezone.Valid {
+		evt.Timezone = &timezone.String
+	}
+	if localStart.Valid {
+		evt.LocalStart = &localStart.String
+	}
 
 	// Reminders field is left empty - populate separately if needed
 	evt.Reminders = []Reminder{}
@@ -508,6 +568,7 @@ func (q *Queries) scanEventFromRows(rows *sql.Rows) (*Event, error) {
 
 // expandRecurringEvent expands a master event into virtual instances for on-demand queries.
 // This is used as a fallback when pre-generated instances are not available.
+// Uses timezone-aware expansion to correctly handle DST transitions.
 func (q *Queries) expandRecurringEvent(
 	event *Event,
 	viewStart, viewEnd int64,
@@ -523,8 +584,28 @@ func (q *Queries) expandRecurringEvent(
 		return nil
 	}
 
-	// Apply DTSTART from event start
-	opt.Dtstart = time.Unix(event.StartTs, 0).UTC()
+	// Load timezone for DST-aware expansion (default to UTC if not set)
+	loc := time.UTC
+	if event.Timezone != nil && *event.Timezone != "" {
+		loc, err = time.LoadLocation(*event.Timezone)
+		if err != nil {
+			logger.Warn("Failed to load timezone %s, falling back to UTC: %v", *event.Timezone, err)
+			loc = time.UTC
+		}
+	}
+
+	// Apply DTSTART in local timezone for DST-aware recurrence expansion
+	// If local_start is set, parse it in the timezone; otherwise use start_ts
+	if event.LocalStart != nil && *event.LocalStart != "" {
+		localTime, err := time.ParseInLocation("2006-01-02T15:04:05", *event.LocalStart, loc)
+		if err == nil {
+			opt.Dtstart = localTime
+		} else {
+			opt.Dtstart = time.Unix(event.StartTs, 0).In(loc)
+		}
+	} else {
+		opt.Dtstart = time.Unix(event.StartTs, 0).In(loc)
+	}
 
 	// Build RRULE
 	r, err := rr.NewRRule(*opt)
@@ -533,10 +614,10 @@ func (q *Queries) expandRecurringEvent(
 		return nil
 	}
 
-	// Expand occurrences within the view window
+	// Expand occurrences within the view window (in local timezone)
 	occurrences := r.Between(
-		time.Unix(viewStart, 0).UTC(),
-		time.Unix(viewEnd, 0).UTC(),
+		time.Unix(viewStart, 0).In(loc),
+		time.Unix(viewEnd, 0).In(loc),
 		true,
 	)
 
@@ -548,11 +629,19 @@ func (q *Queries) expandRecurringEvent(
 
 	instances := make([]*Event, 0, len(occurrences))
 	for _, occ := range occurrences {
-		occTs := occ.Unix()
+		// Convert occurrence to UTC for storage
+		occTs := occ.UTC().Unix()
 
 		// Skip excluded instances
 		if exDateMap[occTs] {
 			continue
+		}
+
+		// Compute local_start for this occurrence (format in event TZ for DST consistency)
+		var localStart *string
+		if event.Timezone != nil && *event.Timezone != "" {
+			ls := occ.In(loc).Format("2006-01-02T15:04:05")
+			localStart = &ls
 		}
 
 		// Create virtual instance (not persisted, for on-demand expansion only)
@@ -565,6 +654,8 @@ func (q *Queries) expandRecurringEvent(
 			EndTs:               occTs + event.Duration,
 			CreatedTs:           event.CreatedTs,
 			UpdatedTs:           event.UpdatedTs,
+			Timezone:            event.Timezone,
+			LocalStart:          localStart,
 			IsRecurringInstance: true,
 			MasterEventUID:      &event.EventUID,
 			OriginalStartTs:     &occTs,
@@ -599,6 +690,8 @@ func (q *Queries) UpdateEvent(ctx context.Context, event *Event) error {
 		    is_modified = $10,
 		    is_cancelled = $11,
 		    metadata = $12,
+		    timezone = $13,
+		    local_start = $14,
 		    updated_ts = EXTRACT(EPOCH FROM NOW())::BIGINT
 		WHERE event_uid = $1
 	`
@@ -636,6 +729,8 @@ func (q *Queries) UpdateEvent(ctx context.Context, event *Event) error {
 		event.IsModified,
 		event.IsCancelled,
 		metadata,
+		db.ToNullableString(event.Timezone),
+		db.ToNullableString(event.LocalStart),
 	)
 
 	return err
@@ -712,6 +807,7 @@ func (q *Queries) CreateEventWithInstances(
 }
 
 // calculateRecurrenceStatus determines if a recurring event is active or inactive
+// Uses timezone-aware handling for DST correctness.
 func (q *Queries) calculateRecurrenceStatus(
 	event *Event,
 	window GenerationWindow,
@@ -736,13 +832,33 @@ func (q *Queries) calculateRecurrenceStatus(
 
 	// If there's a COUNT limit, check if we'd exceed it within the window
 	if opt.Count > 0 {
-		opt.Dtstart = time.Unix(event.StartTs, 0).UTC()
+		// Load timezone for DST-aware expansion
+		loc := time.UTC
+		if event.Timezone != nil && *event.Timezone != "" {
+			loc, err = time.LoadLocation(*event.Timezone)
+			if err != nil {
+				loc = time.UTC
+			}
+		}
+
+		// Apply DTSTART in local timezone
+		if event.LocalStart != nil && *event.LocalStart != "" {
+			localTime, err := time.ParseInLocation("2006-01-02T15:04:05", *event.LocalStart, loc)
+			if err == nil {
+				opt.Dtstart = localTime
+			} else {
+				opt.Dtstart = time.Unix(event.StartTs, 0).In(loc)
+			}
+		} else {
+			opt.Dtstart = time.Unix(event.StartTs, 0).In(loc)
+		}
+
 		r, err := rr.NewRRule(*opt)
 		if err != nil {
 			return RecurrenceStatusInactive
 		}
 		windowEnd := time.Now().Add(window.WindowDuration)
-		occurrences := r.Between(time.Unix(event.StartTs, 0).UTC(), windowEnd, true)
+		occurrences := r.Between(opt.Dtstart, windowEnd.In(loc), true)
 		if len(occurrences) >= opt.Count {
 			return RecurrenceStatusInactive
 		}
@@ -753,6 +869,7 @@ func (q *Queries) calculateRecurrenceStatus(
 
 // generateInstances creates instance events from a master event within a time range
 // Note: Reminders are NOT copied here - use reminder repository's CopyRemindersToNewEvent
+// Uses timezone-aware expansion to correctly handle DST transitions.
 func (q *Queries) generateInstances(master *Event, startTs, endTs int64) []*Event {
 	if master == nil || master.Recurrence == nil || master.Recurrence.Rule == "" {
 		return nil
@@ -763,15 +880,41 @@ func (q *Queries) generateInstances(master *Event, startTs, endTs int64) []*Even
 		return nil
 	}
 
-	opt.Dtstart = time.Unix(master.StartTs, 0).UTC()
+	// Load timezone for DST-aware expansion (default to UTC if not set)
+	loc := time.UTC
+	if master.Timezone != nil && *master.Timezone != "" {
+		loc, err = time.LoadLocation(*master.Timezone)
+		if err != nil {
+			logger.Warn(
+				"Failed to load timezone %s, falling back to UTC: %v",
+				*master.Timezone,
+				err,
+			)
+			loc = time.UTC
+		}
+	}
+
+	// Apply DTSTART in local timezone for DST-aware recurrence expansion
+	if master.LocalStart != nil && *master.LocalStart != "" {
+		localTime, err := time.ParseInLocation("2006-01-02T15:04:05", *master.LocalStart, loc)
+		if err == nil {
+			opt.Dtstart = localTime
+		} else {
+			opt.Dtstart = time.Unix(master.StartTs, 0).In(loc)
+		}
+	} else {
+		opt.Dtstart = time.Unix(master.StartTs, 0).In(loc)
+	}
+
 	r, err := rr.NewRRule(*opt)
 	if err != nil {
 		return nil
 	}
 
+	// Expand occurrences in local timezone
 	occurrences := r.Between(
-		time.Unix(startTs, 0).UTC(),
-		time.Unix(endTs, 0).UTC(),
+		time.Unix(startTs, 0).In(loc),
+		time.Unix(endTs, 0).In(loc),
 		true,
 	)
 
@@ -785,11 +928,19 @@ func (q *Queries) generateInstances(master *Event, startTs, endTs int64) []*Even
 	instances := make([]*Event, 0, len(occurrences))
 
 	for _, occ := range occurrences {
-		occTs := occ.Unix()
+		// Convert occurrence to UTC for storage
+		occTs := occ.UTC().Unix()
 
 		// Skip excluded instances
 		if exDateMap[occTs] {
 			continue
+		}
+
+		// Compute local_start for this occurrence (format in event TZ for DST consistency)
+		var localStart *string
+		if master.Timezone != nil && *master.Timezone != "" {
+			ls := occ.In(loc).Format("2006-01-02T15:04:05")
+			localStart = &ls
 		}
 
 		instance := &Event{
@@ -801,6 +952,8 @@ func (q *Queries) generateInstances(master *Event, startTs, endTs int64) []*Even
 			EndTs:               occTs + master.Duration,
 			CreatedTs:           now,
 			UpdatedTs:           now,
+			Timezone:            master.Timezone,
+			LocalStart:          localStart,
 			IsRecurringInstance: true,
 			MasterEventUID:      &master.EventUID,
 			OriginalStartTs:     &occTs,
@@ -852,19 +1005,21 @@ func (q *Queries) insertInstanceBatch(ctx context.Context, instances []*Event) e
 		INSERT INTO calendar_events (
 			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
 			created_ts, updated_ts, is_recurring_instance, master_event_uid,
-			original_start_ts, is_modified, is_cancelled, exdates_ts, metadata
+			original_start_ts, is_modified, is_cancelled, exdates_ts, metadata,
+			timezone, local_start
 		) VALUES `
 
-	values := make([]interface{}, 0, len(instances)*15)
+	values := make([]interface{}, 0, len(instances)*17)
 	placeholders := make([]string, 0, len(instances))
 
 	for i, inst := range instances {
-		base := i * 15
+		base := i * 17
 		placeholders = append(placeholders,
 			"($"+itoa(base+1)+", $"+itoa(base+2)+", $"+itoa(base+3)+", $"+itoa(base+4)+
 				", $"+itoa(base+5)+", $"+itoa(base+6)+", $"+itoa(base+7)+", $"+itoa(base+8)+
 				", $"+itoa(base+9)+", $"+itoa(base+10)+", $"+itoa(base+11)+", $"+itoa(base+12)+
-				", $"+itoa(base+13)+", $"+itoa(base+14)+", $"+itoa(base+15)+")")
+				", $"+itoa(base+13)+", $"+itoa(base+14)+", $"+itoa(base+15)+", $"+itoa(base+16)+
+				", $"+itoa(base+17)+")")
 
 		metadata := inst.Metadata
 		if len(metadata) == 0 {
@@ -887,6 +1042,8 @@ func (q *Queries) insertInstanceBatch(ctx context.Context, instances []*Event) e
 			inst.IsCancelled,
 			pq.Array([]int64{}),
 			metadata,
+			db.ToNullableString(inst.Timezone),
+			db.ToNullableString(inst.LocalStart),
 		)
 	}
 
@@ -924,7 +1081,7 @@ func (q *Queries) GetFutureInstances(
 			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
 			created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts,
 			exdates_ts, is_recurring_instance, master_event_uid, original_start_ts,
-			is_modified, is_cancelled, metadata
+			is_modified, is_cancelled, metadata, timezone, local_start
 		FROM calendar_events
 		WHERE master_event_uid = $1
 		AND is_recurring_instance = TRUE
@@ -937,7 +1094,11 @@ func (q *Queries) GetFutureInstances(
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logger.Error("failed to close rows: %v", closeErr)
+		}
+	}()
 
 	instances := make([]*Event, 0)
 	for rows.Next() {
@@ -985,7 +1146,7 @@ func (q *Queries) GetActiveRecurringEvents(ctx context.Context, limit int) ([]*E
 		SELECT e.event_uid, e.calendar_uid, e.account_id, e.start_ts, e.duration, e.end_ts,
 			e.created_ts, e.updated_ts, e.recurrence, e.recurrence_status, e.recurrence_end_ts,
 			e.exdates_ts, e.is_recurring_instance, e.master_event_uid, e.original_start_ts,
-			e.is_modified, e.is_cancelled, e.metadata
+			e.is_modified, e.is_cancelled, e.metadata, e.timezone, e.local_start
 		FROM calendar_events e
 		LEFT JOIN (
 			SELECT master_event_uid, MAX(start_ts) as latest_instance
@@ -1007,7 +1168,11 @@ func (q *Queries) GetActiveRecurringEvents(ctx context.Context, limit int) ([]*E
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logger.Error("failed to close rows: %v", closeErr)
+		}
+	}()
 
 	events := make([]*Event, 0)
 	for rows.Next() {
@@ -1086,4 +1251,253 @@ func (q *Queries) CountInstancesByMaster(ctx context.Context, masterUID uuid.UUI
 	var count int
 	err := q.pool.DB().QueryRowContext(ctx, query, masterUID).Scan(&count)
 	return count, err
+}
+
+// BeginTx starts a new transaction
+func (q *Queries) BeginTx(ctx context.Context) (*sql.Tx, error) {
+	return q.pool.DB().BeginTx(ctx, nil)
+}
+
+// CreateEventTx creates an event within a transaction
+func (q *Queries) CreateEventTx(ctx context.Context, tx *sql.Tx, event *Event) (Event, error) {
+	// Validate recurrence rule if provided
+	if err := rrule.ValidateRRule(event.Recurrence); err != nil {
+		return Event{}, err
+	}
+
+	query := `
+		--- createEventTx ---
+		INSERT INTO calendar_events (
+			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
+			created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts,
+			exdates_ts, is_recurring_instance, master_event_uid, original_start_ts,
+			is_modified, is_cancelled, metadata, timezone, local_start
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+		RETURNING event_uid, calendar_uid, account_id, start_ts, duration, end_ts, 
+		          created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts, 
+		          exdates_ts, is_recurring_instance, master_event_uid, original_start_ts, 
+		          is_modified, is_cancelled, metadata, timezone, local_start
+	`
+
+	// Marshal recurrence to JSON (empty/nil becomes SQL NULL)
+	var recurrenceJSON []byte
+	if !rrule.IsRRuleEmpty(event.Recurrence) {
+		var err error
+		recurrenceJSON, err = json.Marshal(event.Recurrence)
+		if err != nil {
+			return Event{}, err
+		}
+	}
+
+	// exdates_ts is NOT NULL in DB, use empty array if nil
+	exdatesTs := event.ExDatesTs
+	if exdatesTs == nil {
+		exdatesTs = []int64{}
+	}
+
+	// metadata is NOT NULL in DB, use empty object if nil
+	metadata := event.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+
+	var resultEvent Event
+	var recurrenceJSONReturned []byte
+	var recurrenceStatusReturned sql.NullString
+	var recurrenceEndTsReturned sql.NullInt64
+	var masterEventUIDReturned *uuid.UUID
+	var originalStartTsReturned sql.NullInt64
+	var timezoneReturned sql.NullString
+	var localStartReturned sql.NullString
+
+	err := tx.QueryRowContext(ctx, query,
+		event.EventUID,
+		event.CalendarUID,
+		event.AccountID,
+		event.StartTs,
+		event.Duration,
+		event.EndTs,
+		event.CreatedTs,
+		event.UpdatedTs,
+		db.ToNullString(recurrenceJSON),
+		db.ToNullableString(event.RecurrenceStatus),
+		db.ToNullInt64(event.RecurrenceEndTs),
+		pq.Array(exdatesTs),
+		event.IsRecurringInstance,
+		db.ToNullUUID(event.MasterEventUID),
+		db.ToNullInt64(event.OriginalStartTs),
+		event.IsModified,
+		event.IsCancelled,
+		metadata,
+		db.ToNullableString(event.Timezone),
+		db.ToNullableString(event.LocalStart),
+	).Scan(
+		&resultEvent.EventUID,
+		&resultEvent.CalendarUID,
+		&resultEvent.AccountID,
+		&resultEvent.StartTs,
+		&resultEvent.Duration,
+		&resultEvent.EndTs,
+		&resultEvent.CreatedTs,
+		&resultEvent.UpdatedTs,
+		&recurrenceJSONReturned,
+		&recurrenceStatusReturned,
+		&recurrenceEndTsReturned,
+		pq.Array(&resultEvent.ExDatesTs),
+		&resultEvent.IsRecurringInstance,
+		&masterEventUIDReturned,
+		&originalStartTsReturned,
+		&resultEvent.IsModified,
+		&resultEvent.IsCancelled,
+		&resultEvent.Metadata,
+		&timezoneReturned,
+		&localStartReturned,
+	)
+	if err != nil {
+		return Event{}, err
+	}
+
+	// Parse recurrence JSON
+	if len(recurrenceJSONReturned) > 0 {
+		if err := json.Unmarshal(recurrenceJSONReturned, &resultEvent.Recurrence); err != nil {
+			return Event{}, err
+		}
+		if rrule.IsRRuleEmpty(resultEvent.Recurrence) {
+			resultEvent.Recurrence = nil
+		}
+	}
+
+	// Map nullable fields
+	if recurrenceStatusReturned.Valid {
+		status := RecurrenceStatus(recurrenceStatusReturned.String)
+		resultEvent.RecurrenceStatus = &status
+	}
+	if recurrenceEndTsReturned.Valid {
+		resultEvent.RecurrenceEndTs = &recurrenceEndTsReturned.Int64
+	}
+	resultEvent.MasterEventUID = masterEventUIDReturned
+	if originalStartTsReturned.Valid {
+		resultEvent.OriginalStartTs = &originalStartTsReturned.Int64
+	}
+	if timezoneReturned.Valid {
+		resultEvent.Timezone = &timezoneReturned.String
+	}
+	if localStartReturned.Valid {
+		resultEvent.LocalStart = &localStartReturned.String
+	}
+
+	return resultEvent, nil
+}
+
+// BulkInsertInstancesTx inserts multiple event instances within a transaction
+func (q *Queries) BulkInsertInstancesTx(ctx context.Context, tx *sql.Tx, instances []*Event) error {
+	if len(instances) == 0 {
+		return nil
+	}
+
+	query := `
+		INSERT INTO calendar_events (
+			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
+			created_ts, updated_ts, timezone, local_start,
+			is_recurring_instance, master_event_uid, original_start_ts,
+			is_modified, is_cancelled, metadata, exdates_ts
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+	`
+
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+
+	defer func() {
+		if err := stmt.Close(); err != nil {
+			logger.Warn("Failed to close statement: %v", err)
+		}
+	}()
+
+	for _, inst := range instances {
+		exdatesTs := inst.ExDatesTs
+		if exdatesTs == nil {
+			exdatesTs = []int64{}
+		}
+
+		// metadata is NOT NULL in DB, use empty object if nil
+		metadata := inst.Metadata
+		if len(metadata) == 0 {
+			metadata = json.RawMessage("{}")
+		}
+
+		_, err := stmt.ExecContext(ctx,
+			inst.EventUID,
+			inst.CalendarUID,
+			inst.AccountID,
+			inst.StartTs,
+			inst.Duration,
+			inst.EndTs,
+			inst.CreatedTs,
+			inst.UpdatedTs,
+			inst.Timezone,
+			inst.LocalStart,
+			inst.IsRecurringInstance,
+			inst.MasterEventUID,
+			inst.OriginalStartTs,
+			inst.IsModified,
+			inst.IsCancelled,
+			metadata,
+			pq.Array(exdatesTs),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert instance: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// CreateEventWithInstancesTx creates a recurring event with instances within a transaction
+func (q *Queries) CreateEventWithInstancesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	event *Event,
+	window GenerationWindow,
+) (*Event, []*Event, error) {
+	// Validate this is a recurring event
+	if event.Recurrence == nil || event.Recurrence.Rule == "" {
+		return nil, nil, nil
+	}
+
+	if err := rrule.ValidateRRule(event.Recurrence); err != nil {
+		return nil, nil, err
+	}
+
+	// Set master event properties
+	event.IsRecurringInstance = false
+	event.MasterEventUID = nil
+	event.OriginalStartTs = nil
+
+	// Calculate recurrence status
+	status := q.calculateRecurrenceStatus(event, window)
+	event.RecurrenceStatus = &status
+
+	// Create the master event
+	createdEvent, err := q.CreateEventTx(ctx, tx, event)
+	if err != nil {
+		return nil, nil, err
+	}
+	*event = createdEvent
+
+	// Generate instances for the window
+	now := time.Now().UTC()
+	windowEnd := now.Add(window.WindowDuration + window.BufferDuration)
+
+	instances := q.generateInstances(event, event.StartTs, windowEnd.Unix())
+
+	// Bulk insert the instances
+	if len(instances) > 0 {
+		if err := q.BulkInsertInstancesTx(ctx, tx, instances); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return event, instances, nil
 }

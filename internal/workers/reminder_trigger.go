@@ -12,7 +12,11 @@ import (
 
 // ReminderRepository defines the interface for reminder operations needed by the worker
 type ReminderRepository interface {
-	GetDueRemindersWithEvents(ctx context.Context, beforeTs int64, limit int) ([]*event.ReminderWithEvent, error)
+	GetDueRemindersWithEvents(
+		ctx context.Context,
+		beforeTs int64,
+		limit int,
+	) ([]*event.ReminderWithEvent, error)
 	MarkReminderDelivered(ctx context.Context, reminderUID uuid.UUID) error
 }
 

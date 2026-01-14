@@ -1,12 +1,10 @@
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 import {
-  AccountObject,
   CalendarObject,
   ErrorObject,
   GenericPagedResponse,
   SuccessObject,
 } from "../helpers/types";
-import { createAccount, deleteAccount } from "../helpers/account";
 import {
   createCalendar,
   deleteCalendar,
@@ -16,35 +14,15 @@ import {
 } from "../helpers/calendar";
 
 describe("Single Event API", () => {
-  const accounts: string[] = [];
   let calendarUid: string;
-  let eventUid: string;
-
-  afterAll(async () => {
-    // deleting accounts will cascade to delete calendars and events
-    for (const account of accounts) {
-      const response = (await deleteAccount({
-        accountId: account,
-      })) as SuccessObject;
-      expect(response.success).toBe(true);
-    }
-  });
-
-  beforeAll(async () => {
-    const accountUUID = crypto.randomUUID();
-    const response = (await createAccount({
-      accountId: accountUUID,
-    })) as AccountObject;
-    expect(response.account_id).toBe(accountUUID);
-    accounts.push(response.account_id);
-  });
+  let accountId: string = crypto.randomUUID();
 
   test("Should create a calendar", async () => {
     const response = (await createCalendar({
-      accountId: accounts[0],
+      accountId: accountId,
     })) as CalendarObject;
     expect(response.calendar_uid).toBeDefined();
-    expect(response.account_id).toBe(accounts[0]);
+    expect(response.account_id).toBe(accountId);
     calendarUid = response.calendar_uid;
   });
 
@@ -53,7 +31,7 @@ describe("Single Event API", () => {
       calendarUid: calendarUid,
     })) as CalendarObject;
     expect(response.calendar_uid).toBe(calendarUid);
-    expect(response.account_id).toBe(accounts[0]);
+    expect(response.account_id).toBe(accountId);
   });
 
   test("Should update a calendar", async () => {
@@ -63,18 +41,18 @@ describe("Single Event API", () => {
       metadata: { test: "calendar" },
     })) as CalendarObject;
     expect(response.calendar_uid).toBe(calendarUid);
-    expect(response.account_id).toBe(accounts[0]);
+    expect(response.account_id).toBe(accountId);
     expect(response.settings).toEqual({ test: "value" });
     expect(response.metadata).toEqual({ test: "calendar" });
   });
 
   test("Should get user calendars", async () => {
     const response = (await getUserCalendars({
-      accountId: accounts[0],
+      accountId: accountId,
     })) as GenericPagedResponse<CalendarObject>;
     expect(response.count).toBe(1);
     expect(response.data[0].calendar_uid).toBe(calendarUid);
-    expect(response.data[0].account_id).toBe(accounts[0]);
+    expect(response.data[0].account_id).toBe(accountId);
     expect(response.data[0].settings).toEqual({ test: "value" });
     expect(response.data[0].metadata).toEqual({ test: "calendar" });
   });
