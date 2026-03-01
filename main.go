@@ -65,7 +65,7 @@ func main() {
 	}()
 
 	// Run database migrations
-	if err := db.RunMigrations(dbPool.DB(), "internal/db/migrations"); err != nil {
+	if err := db.RunMigrations(dbPool.DB()); err != nil {
 		logger.Fatal("Failed to run database migrations: %v", err)
 	}
 

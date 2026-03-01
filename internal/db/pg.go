@@ -2,9 +2,9 @@ package db
 
 import (
 	"context"
-	"os"
-	"path/filepath"
+	"io/fs"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jaysongiroux/go-scheduler/internal/config"
@@ -60,18 +60,17 @@ func (p *ConnectionPool) Close() error {
 	return p.db.Close()
 }
 
-// RunMigrations reads and executes all SQL migration files from a directory
-func RunMigrations(db *sqlx.DB, migrationsDir string) error {
-	files, err := os.ReadDir(migrationsDir)
+// RunMigrations runs all SQL migration files embedded in the binary.
+func RunMigrations(db *sqlx.DB) error {
+	entries, err := fs.ReadDir(MigrationsFS, "migrations")
 	if err != nil {
 		return err
 	}
 
-	// Filter and sort SQL files
 	var sqlFiles []string
-	for _, f := range files {
-		if !f.IsDir() && filepath.Ext(f.Name()) == ".sql" {
-			sqlFiles = append(sqlFiles, f.Name())
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			sqlFiles = append(sqlFiles, e.Name())
 		}
 	}
 	sort.Strings(sqlFiles)
@@ -80,8 +79,8 @@ func RunMigrations(db *sqlx.DB, migrationsDir string) error {
 	defer cancel()
 
 	for _, filename := range sqlFiles {
-		path := filepath.Join(migrationsDir, filename)
-		content, err := os.ReadFile(filepath.Clean(path))
+		path := "migrations/" + filename
+		content, err := fs.ReadFile(MigrationsFS, path)
 		if err != nil {
 			return err
 		}
@@ -123,7 +122,7 @@ func NewPostgresStore(cfg *config.Config) (*PostgresStore, error) {
 	}
 
 	// Run migrations
-	if err := RunMigrations(store.db, "internal/db/migrations"); err != nil {
+	if err := RunMigrations(store.db); err != nil {
 		logger.Fatal("Failed to run database migrations: %v", err)
 	}
 
