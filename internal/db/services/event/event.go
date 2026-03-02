@@ -456,23 +456,19 @@ func (q *Queries) GetCalendarEvents(
 	}
 
 	if startTs > 0 && endTs > 0 {
-		// Time range provided - expand on-demand if no instances exist
+		// Time range provided - expand on-demand if no instances exist.
+		// Never include the master as a separate event in range-based list; return only instances
+		// so each occurrence appears once (avoids duplicate on the first day).
 		for masterUID, master := range masterEvents {
 			if !instancedMasters[masterUID] {
 				// No pre-generated instances for this master in the range
-				// Fall back to on-demand expansion
+				// Fall back to on-demand expansion (instances only, not master)
 				instances := q.expandRecurringEvent(master, startTs, endTs)
-
-				// Only include master event if there are instances in the range
 				if len(instances) > 0 {
-					allEvents = append(allEvents, master)
 					allEvents = append(allEvents, instances...)
 				}
-			} else {
-				// Pre-generated instances exist, include the master event only if it has instances
-				// Master event is included for reference (contains recurrence rule, etc.)
-				allEvents = append(allEvents, master)
 			}
+			// When pre-generated instances exist they are already in allEvents; do not add master
 		}
 	} else {
 		// No time range - return master events as-is (without expansion)

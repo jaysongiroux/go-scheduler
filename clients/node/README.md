@@ -23,7 +23,7 @@ const client = new SchedulerClient({
   baseURL: "http://localhost:8080",
   timeout: 30000,
   headers: {
-    "Authorization": "Bearer your-token-here"
+    "api-key": "your-token-here"
   }
 });
 
@@ -396,10 +396,10 @@ You can set custom headers after initializing the client:
 
 ```typescript
 // Set a header
-client.setHeader("Authorization", "Bearer new-token");
+client.setHeader("api-key", "new-token");
 
 // Remove a header
-client.removeHeader("Authorization");
+client.removeHeader("api-key");
 ```
 
 ## Recurring Events

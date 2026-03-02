@@ -580,8 +580,8 @@ describe("Timezone Recurring Events", () => {
       endTs: now + 86400 * 30,
     })) as GenericPagedResponse<EventObject>;
 
-    // Should have master + 5 instances = 6 events
-    expect(getResponse.count).toBe(6);
+    // List returns only instances (one per occurrence), not the master
+    expect(getResponse.count).toBe(5);
 
     // All instances should inherit timezone
     for (const event of getResponse.data) {
@@ -619,21 +619,18 @@ describe("Timezone Recurring Events", () => {
       endTs: now + 86400 * 30,
     })) as GenericPagedResponse<EventObject>;
 
-    // Extract the time portion from the master event's local_start
-    const masterEvent = getResponse.data.find(
-      (e) => !e.is_recurring_instance && e.recurrence !== null
-    );
-    expect(masterEvent).toBeDefined();
-    expect(masterEvent?.local_start).toBeDefined();
+    // List returns only instances; use first instance's local time as reference
+    const instances = getResponse.data.filter((e) => e.is_recurring_instance);
+    expect(instances.length).toBeGreaterThan(0);
+    const firstLocalStart = instances[0]?.local_start;
+    expect(firstLocalStart).toBeDefined();
+    const expectedLocalTime = firstLocalStart?.split("T")[1]; // e.g., "14:00:00"
 
-    const masterLocalTime = masterEvent?.local_start?.split("T")[1]; // e.g., "14:00:00"
-
-    // All recurring instances should maintain the same local time as the master
-    // This verifies DST-aware scheduling - the local time stays consistent
-    for (const event of getResponse.data) {
-      if (event.is_recurring_instance && event.local_start) {
+    // All recurring instances should maintain the same local time (DST-aware scheduling)
+    for (const event of instances) {
+      if (event.local_start) {
         const instanceLocalTime = event.local_start.split("T")[1];
-        expect(instanceLocalTime).toBe(masterLocalTime);
+        expect(instanceLocalTime).toBe(expectedLocalTime);
       }
     }
   });
