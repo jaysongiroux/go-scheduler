@@ -278,19 +278,21 @@ describe("Recurring Event API", () => {
   });
 
   test("Update single instance of recurring event", async () => {
+    const targetStart = Math.floor(Date.now() / 1000) + 3600;
+    const targetEnd = targetStart + 3600;
     const response = (await updateEvent({
       eventUid: masterEventUid,
       accountId,
-      startTs: Math.floor(Date.now() / 1000) + 3600,
-      endTs: Math.floor(Date.now() / 1000) + 3600 + 3600,
+      startTs: targetStart,
+      endTs: targetEnd,
       scope: "single",
       metadata: { title: "Updated Event" },
       recurrence: { rule: "FREQ=DAILY;COUNT=10" },
     })) as EventObject;
     expect(response.event_uid).toBe(masterEventUid);
     expect(response.calendar_uid).toBe(calendarUid);
-    expect(response.start_ts).toBe(Math.floor(Date.now() / 1000) + 3600);
-    expect(response.end_ts).toBe(Math.floor(Date.now() / 1000) + 3600 + 3600);
+    expect(response.start_ts).toBe(targetStart);
+    expect(response.end_ts).toBe(targetEnd);
     expect(response.metadata).toEqual({ title: "Updated Event" });
 
     const getResponse = (await getCalendarEvents({
@@ -301,9 +303,18 @@ describe("Recurring Event API", () => {
     expect(getResponse.count).toBe(10);
     expect(getResponse.data).toHaveLength(10);
     expect(getResponse.data[0].calendar_uid).toBe(calendarUid);
-    // Update with scope "single" on master only updates the master record; list returns instances only (unchanged)
+    // Update with scope "single" changes only the targeted occurrence.
     expect(getResponse.data.every((e) => e.master_event_uid === masterEventUid)).toBe(true);
-    expect(getResponse.data.every((e) => e.metadata?.title === "Test Event")).toBe(true);
+    const updated = getResponse.data.filter(
+      (e) => (e.metadata as { title?: string })?.title === "Updated Event"
+    );
+    const original = getResponse.data.filter(
+      (e) => (e.metadata as { title?: string })?.title === "Test Event"
+    );
+    expect(updated).toHaveLength(1);
+    expect(original).toHaveLength(9);
+    expect(updated[0]?.start_ts).toBe(targetStart);
+    expect(updated[0]?.end_ts).toBe(targetEnd);
   });
 
   test("Update entire series based on the master event of recurring event", async () => {
@@ -335,6 +346,72 @@ describe("Recurring Event API", () => {
       expect(event.calendar_uid).toBe(calendarUid);
       expect(event.metadata).toEqual({ title: "Updated Event" });
     }
+  });
+
+  test("Single-scope metadata update affects only the targeted instance", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const baseStart = now + 7200; // first occurrence at +2h
+    const baseEnd = baseStart + 3600;
+    const originalTitle = "Original Recurring Title";
+    const updatedTitle = "Only This Instance Updated";
+
+    const createResponse = (await createEvent({
+      calendarUid,
+      accountId,
+      startTs: baseStart,
+      endTs: baseEnd,
+      metadata: { title: originalTitle },
+      recurrence: { rule: "FREQ=DAILY;COUNT=5" },
+    })) as EventObject;
+    expect(createResponse.event_uid).toBeDefined();
+    expect(createResponse.metadata).toEqual({ title: originalTitle });
+    const masterUid = createResponse.event_uid;
+
+    const listBefore = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 10,
+    })) as GenericPagedResponse<EventObject>;
+    const ourInstancesBefore = listBefore.data.filter(
+      (e) => e.master_event_uid === masterUid || e.event_uid === masterUid
+    );
+    expect(ourInstancesBefore).toHaveLength(5);
+    expect(ourInstancesBefore.every((e) => e.metadata?.title === originalTitle)).toBe(true);
+
+    // Update the second occurrence only (day 2: baseStart + 86400)
+    const secondOccurrenceStart = baseStart + 86400;
+    const secondOccurrenceEnd = baseEnd + 86400;
+    const updateResponse = (await updateEvent({
+      eventUid: masterUid,
+      accountId,
+      startTs: secondOccurrenceStart,
+      endTs: secondOccurrenceEnd,
+      scope: "single",
+      metadata: { title: updatedTitle },
+    })) as EventObject;
+    expect(updateResponse.metadata).toEqual({ title: updatedTitle });
+
+    const listAfter = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 10,
+    })) as GenericPagedResponse<EventObject>;
+    const ourInstancesAfter = listAfter.data.filter(
+      (e) => e.master_event_uid === masterUid || e.event_uid === masterUid
+    );
+    expect(ourInstancesAfter).toHaveLength(5);
+
+    const withUpdatedMetadata = ourInstancesAfter.filter(
+      (e) => (e.metadata as { title?: string })?.title === updatedTitle
+    );
+    const withOriginalMetadata = ourInstancesAfter.filter(
+      (e) => (e.metadata as { title?: string })?.title === originalTitle
+    );
+
+    expect(withUpdatedMetadata).toHaveLength(1);
+    expect(withOriginalMetadata).toHaveLength(4);
+    expect(withUpdatedMetadata[0].start_ts).toBe(secondOccurrenceStart);
+    expect(withUpdatedMetadata[0].end_ts).toBe(secondOccurrenceEnd);
   });
 });
 

@@ -658,37 +658,98 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		// This is a master recurring event
 		switch scope {
 		case ScopeSingle, "":
-			// Update only the master event itself (not instances)
-			// This updates the "template" for future instances but doesn't modify existing ones
-			existingEvent.StartTs = updateData.StartTs
-			existingEvent.Duration = updateData.Duration
-			existingEvent.EndTs = updateData.EndTs
-			existingEvent.Metadata = updateData.Metadata
-			if updateData.Recurrence != nil {
-				existingEvent.Recurrence = updateData.Recurrence
+			// Update only the targeted instance (identified by start_ts), not the master
+			instance, err := h.EventRepo.GetInstanceByMasterAndOriginalStart(
+				r.Context(),
+				existingEvent.EventUID,
+				updateData.StartTs,
+			)
+			if err == nil {
+				// Instance exists: update its metadata and times
+				instance.StartTs = updateData.StartTs
+				instance.Duration = updateData.Duration
+				instance.EndTs = updateData.EndTs
+				instance.Metadata = updateData.Metadata
+				instance.IsModified = true
+				if err := h.EventRepo.UpdateEvent(r.Context(), instance); err != nil {
+					web.RespondError(
+						w,
+						http.StatusInternalServerError,
+						"Failed to update instance",
+						err.Error(),
+					)
+					return
+				}
+				response := *existingEvent
+				response.StartTs = updateData.StartTs
+				response.Duration = updateData.Duration
+				response.EndTs = updateData.EndTs
+				response.Metadata = updateData.Metadata
+				if updateData.Recurrence != nil {
+					response.Recurrence = updateData.Recurrence
+				}
+				web.RespondJSON(w, http.StatusOK, response)
+				if err := h.WebhookDispatcher.QueueDelivery(
+					r.Context(),
+					workers.EventUpdated,
+					*instance,
+					&instance.StartTs,
+				); err != nil {
+					logger.Error("Failed to queue webhook for event update: %v", err)
+				}
+				return
 			}
-
-			if err := h.EventRepo.UpdateEvent(r.Context(), existingEvent); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
 				web.RespondError(
 					w,
 					http.StatusInternalServerError,
-					"Failed to update master event",
+					"Failed to find instance",
 					err.Error(),
 				)
 				return
 			}
-
-			web.RespondJSON(w, http.StatusOK, existingEvent)
-
-			// Queue webhook delivery
-			if err := h.WebhookDispatcher.QueueDelivery(
-				r.Context(),
-				workers.EventUpdated,
-				*existingEvent,
-				&existingEvent.StartTs,
-			); err != nil {
-				logger.Error("Failed to queue webhook for event update: %v", err)
+			// Instance not yet generated: create an override instance for this occurrence
+			now := time.Now().UTC().Unix()
+			inst := &event.Event{
+				EventUID:            uuid.New(),
+				CalendarUID:         existingEvent.CalendarUID,
+				AccountID:           existingEvent.AccountID,
+				StartTs:             updateData.StartTs,
+				Duration:            updateData.Duration,
+				EndTs:               updateData.EndTs,
+				CreatedTs:           now,
+				UpdatedTs:           now,
+				Recurrence:          existingEvent.Recurrence,
+				RecurrenceStatus:    existingEvent.RecurrenceStatus,
+				RecurrenceEndTs:     existingEvent.RecurrenceEndTs,
+				ExDatesTs:           []int64{},
+				IsRecurringInstance: true,
+				MasterEventUID:      &existingEvent.EventUID,
+				OriginalStartTs:     &updateData.StartTs,
+				IsModified:          true,
+				IsCancelled:         false,
+				Metadata:            updateData.Metadata,
+				Timezone:            existingEvent.Timezone,
+				LocalStart:          existingEvent.LocalStart,
 			}
+			if err := h.EventRepo.InsertSingleInstance(r.Context(), inst); err != nil {
+				web.RespondError(
+					w,
+					http.StatusInternalServerError,
+					"Failed to create instance override",
+					err.Error(),
+				)
+				return
+			}
+			response := *existingEvent
+			response.StartTs = updateData.StartTs
+			response.Duration = updateData.Duration
+			response.EndTs = updateData.EndTs
+			response.Metadata = updateData.Metadata
+			if updateData.Recurrence != nil {
+				response.Recurrence = updateData.Recurrence
+			}
+			web.RespondJSON(w, http.StatusOK, response)
 			return
 
 		case ScopeAll:

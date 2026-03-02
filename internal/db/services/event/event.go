@@ -443,8 +443,8 @@ func (q *Queries) GetCalendarEvents(
 	}()
 
 	allEvents := make([]*Event, 0)
-	masterEvents := make(map[uuid.UUID]*Event)   // Track master events for deduplication
-	instancedMasters := make(map[uuid.UUID]bool) // Track which masters have instances in range
+	masterEvents := make(map[uuid.UUID]*Event)                      // master UID -> master event
+	masterInstances := make(map[uuid.UUID][]*Event)                 // master UID -> instance rows from DB
 
 	for rows.Next() {
 		evt, err := q.scanEventFromRows(rows)
@@ -452,14 +452,9 @@ func (q *Queries) GetCalendarEvents(
 			return nil, err
 		}
 
-		if evt.IsRecurringInstance {
-			// This is a pre-generated instance
-			allEvents = append(allEvents, evt)
-			if evt.MasterEventUID != nil {
-				instancedMasters[*evt.MasterEventUID] = true
-			}
+		if evt.IsRecurringInstance && evt.MasterEventUID != nil {
+			masterInstances[*evt.MasterEventUID] = append(masterInstances[*evt.MasterEventUID], evt)
 		} else if evt.IsMasterEvent() {
-			// Store master events for potential on-demand expansion
 			masterEvents[evt.EventUID] = evt
 		} else {
 			// Regular non-recurring event
@@ -468,19 +463,28 @@ func (q *Queries) GetCalendarEvents(
 	}
 
 	if startTs > 0 && endTs > 0 {
-		// Time range provided - expand on-demand if no instances exist.
-		// Never include the master as a separate event in range-based list; return only instances
-		// so each occurrence appears once (avoids duplicate on the first day).
+		// For each master: expand to get all occurrences, then merge with DB instances
+		// so that single-scope overrides (modified instances) show correct metadata.
 		for masterUID, master := range masterEvents {
-			if !instancedMasters[masterUID] {
-				// No pre-generated instances for this master in the range
-				// Fall back to on-demand expansion (instances only, not master)
-				instances := q.expandRecurringEvent(master, startTs, endTs)
-				if len(instances) > 0 {
-					allEvents = append(allEvents, instances...)
+			expanded := q.expandRecurringEvent(master, startTs, endTs)
+			dbInstances := masterInstances[masterUID]
+			byOriginalTs := make(map[int64]*Event)
+			for _, inst := range dbInstances {
+				if inst.OriginalStartTs != nil {
+					byOriginalTs[*inst.OriginalStartTs] = inst
 				}
 			}
-			// When pre-generated instances exist they are already in allEvents; do not add master
+			for _, virt := range expanded {
+				occTs := virt.StartTs
+				if virt.OriginalStartTs != nil {
+					occTs = *virt.OriginalStartTs
+				}
+				if dbInst, ok := byOriginalTs[occTs]; ok {
+					allEvents = append(allEvents, dbInst)
+				} else {
+					allEvents = append(allEvents, virt)
+				}
+			}
 		}
 	} else {
 		// No time range - return master events as-is (without expansion)
@@ -1136,6 +1140,91 @@ func (q *Queries) GetMasterEvent(ctx context.Context, instanceUID uuid.UUID) (*E
 	}
 
 	return q.GetEvent(ctx, *instance.MasterEventUID, nil)
+}
+
+// GetInstanceByMasterAndOriginalStart finds an instance by its master event UID and original occurrence time.
+// Returns sql.ErrNoRows if no instance exists (e.g. not yet generated).
+func (q *Queries) GetInstanceByMasterAndOriginalStart(
+	ctx context.Context,
+	masterUID uuid.UUID,
+	originalStartTs int64,
+) (*Event, error) {
+	query := `
+		SELECT 
+			e.event_uid, e.calendar_uid, e.account_id, e.start_ts, e.duration, e.end_ts,
+			e.created_ts, e.updated_ts,
+			COALESCE(e.recurrence, m.recurrence),
+			COALESCE(e.recurrence_status, m.recurrence_status),
+			COALESCE(e.recurrence_end_ts, m.recurrence_end_ts),
+			e.exdates_ts, e.is_recurring_instance, e.master_event_uid, e.original_start_ts,
+			e.is_modified, e.is_cancelled, e.metadata, e.timezone, e.local_start
+		FROM calendar_events e
+		LEFT JOIN calendar_events m
+			ON e.is_recurring_instance = TRUE AND e.master_event_uid = m.event_uid
+		WHERE e.master_event_uid = $1 AND e.original_start_ts = $2 AND e.is_recurring_instance = TRUE
+	`
+	rows, err := q.pool.DB().QueryContext(ctx, query, masterUID, originalStartTs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, sql.ErrNoRows
+	}
+	evt, err := q.scanEventFromRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	return evt, nil
+}
+
+// InsertSingleInstance inserts one recurring instance (e.g. for a single-scope metadata override).
+// Uses ON CONFLICT to update metadata/is_modified if the instance already exists.
+func (q *Queries) InsertSingleInstance(ctx context.Context, inst *Event) error {
+	query := `
+		INSERT INTO calendar_events (
+			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
+			created_ts, updated_ts, is_recurring_instance, master_event_uid,
+			original_start_ts, is_modified, is_cancelled, exdates_ts, metadata,
+			timezone, local_start
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		ON CONFLICT (master_event_uid, original_start_ts)
+		DO UPDATE SET
+			start_ts = EXCLUDED.start_ts,
+			duration = EXCLUDED.duration,
+			end_ts = EXCLUDED.end_ts,
+			metadata = EXCLUDED.metadata,
+			is_modified = EXCLUDED.is_modified,
+			updated_ts = EXTRACT(EPOCH FROM NOW())::BIGINT
+	`
+	metadata := inst.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+	exdatesTs := inst.ExDatesTs
+	if exdatesTs == nil {
+		exdatesTs = []int64{}
+	}
+	_, err := q.pool.DB().ExecContext(ctx, query,
+		inst.EventUID,
+		inst.CalendarUID,
+		inst.AccountID,
+		inst.StartTs,
+		inst.Duration,
+		inst.EndTs,
+		inst.CreatedTs,
+		inst.UpdatedTs,
+		inst.IsRecurringInstance,
+		db.ToNullUUID(inst.MasterEventUID),
+		db.ToNullInt64(inst.OriginalStartTs),
+		inst.IsModified,
+		inst.IsCancelled,
+		pq.Array(exdatesTs),
+		metadata,
+		db.ToNullableString(inst.Timezone),
+		db.ToNullableString(inst.LocalStart),
+	)
+	return err
 }
 
 // AddExDate adds an exclusion date to a master event (for single instance deletion)

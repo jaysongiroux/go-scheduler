@@ -85,6 +85,8 @@ type EventRepository interface {
 	CancelInstance(ctx context.Context, instanceUID uuid.UUID) error
 	ToggleCancelledStatusEvent(ctx context.Context, eventUID uuid.UUID) error
 	CountInstancesByMaster(ctx context.Context, masterUID uuid.UUID) (int, error)
+	GetInstanceByMasterAndOriginalStart(ctx context.Context, masterUID uuid.UUID, originalStartTs int64) (*event.Event, error)
+	InsertSingleInstance(ctx context.Context, inst *event.Event) error
 }
 
 // ReminderRepository defines the interface for reminder operations
