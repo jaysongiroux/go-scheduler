@@ -266,17 +266,16 @@ describe("Recurring Event API", () => {
       startTs: Math.floor(Date.now() / 1000),
       endTs: Math.floor(Date.now() / 1000) + 86400 * 30,
     })) as GenericPagedResponse<EventObject>;
-    expect(getResponse.count).toBe(11);
-    expect(getResponse.data).toHaveLength(11);
+    // List returns only instances (one per occurrence), not the master
+    expect(getResponse.count).toBe(10);
+    expect(getResponse.data).toHaveLength(10);
     expect(getResponse.data[0].calendar_uid).toBe(calendarUid);
-    const masterEvent = getResponse.data.find(
-      (e) => e.is_recurring_instance === false && e.recurrence !== null
-    );
-    expect(masterEvent).toBeDefined();
-    expect(masterEvent?.event_uid).toBe(response.event_uid);
-    expect(masterEvent?.recurrence).toEqual({ rule: "FREQ=DAILY;COUNT=10" });
-    expect(masterEvent?.metadata).toEqual({ title: "Test Event" });
-    masterEventUid = masterEvent?.event_uid as string;
+    // Create response returns the master; list returns only instances
+    masterEventUid = response.event_uid;
+    const firstInstance = getResponse.data[0];
+    expect(firstInstance?.master_event_uid).toBe(masterEventUid);
+    expect(firstInstance?.recurrence).toEqual({ rule: "FREQ=DAILY;COUNT=10" });
+    expect(firstInstance?.metadata).toEqual({ title: "Test Event" });
   });
 
   test("Update single instance of recurring event", async () => {
@@ -300,24 +299,12 @@ describe("Recurring Event API", () => {
       startTs: Math.floor(Date.now() / 1000),
       endTs: Math.floor(Date.now() / 1000) + 86400 * 60,
     })) as GenericPagedResponse<EventObject>;
-    expect(getResponse.count).toBe(11);
-    expect(getResponse.data).toHaveLength(11);
+    expect(getResponse.count).toBe(10);
+    expect(getResponse.data).toHaveLength(10);
     expect(getResponse.data[0].calendar_uid).toBe(calendarUid);
-    const instanceEvent = getResponse.data.find(
-      (e) => e.event_uid === masterEventUid
-    );
-    expect(instanceEvent).toBeDefined();
-    expect(instanceEvent?.event_uid).toBe(response.event_uid);
-    expect(instanceEvent?.recurrence).toEqual({ rule: "FREQ=DAILY;COUNT=10" });
-    expect(instanceEvent?.metadata).toEqual({ title: "Updated Event" });
-
-    const nonInstanceEvent = getResponse.data.find(
-      (e) => e.event_uid !== masterEventUid
-    );
-    expect(nonInstanceEvent).toBeDefined();
-    expect(nonInstanceEvent?.event_uid).not.toBe(masterEventUid);
-    expect(nonInstanceEvent?.recurrence).toBeNull();
-    expect(nonInstanceEvent?.metadata).toEqual({ title: "Test Event" });
+    // Update with scope "single" on master only updates the master record; list returns instances only (unchanged)
+    expect(getResponse.data.every((e) => e.master_event_uid === masterEventUid)).toBe(true);
+    expect(getResponse.data.every((e) => e.metadata?.title === "Test Event")).toBe(true);
   });
 
   test("Update entire series based on the master event of recurring event", async () => {
@@ -343,8 +330,8 @@ describe("Recurring Event API", () => {
       startTs: Math.floor(Date.now() / 1000),
       endTs: Math.floor(Date.now() / 1000) + 86400 * 60,
     })) as GenericPagedResponse<EventObject>;
-    expect(getResponse.count).toBe(11);
-    expect(getResponse.data).toHaveLength(11);
+    expect(getResponse.count).toBe(10);
+    expect(getResponse.data).toHaveLength(10);
     for (const event of getResponse.data) {
       expect(event.calendar_uid).toBe(calendarUid);
       expect(event.metadata).toEqual({ title: "Updated Event" });

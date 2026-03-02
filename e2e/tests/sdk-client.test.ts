@@ -14,7 +14,7 @@ describe("SDK Client Integration Tests", () => {
       baseURL: process.env.SCHEDULER_URL || "http://localhost:8080",
       timeout: 10000,
       headers: {
-        "api-key": process.env.SCHEDULER_API_KEY || "abc123",
+        "api-key": process.env.SCHEDULER_API_KEY || "your-secret-api-key-here",
       },
     });
 

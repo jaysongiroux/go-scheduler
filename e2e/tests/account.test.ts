@@ -1,16 +1,7 @@
 import { describe, expect, test } from "vitest";
-import {
-  createCalendar,
-  getCalendar,
-  getUserCalendars,
-} from "../helpers/calendar";
+import { createCalendar, getCalendar } from "../helpers/calendar";
 import { createEvent, getEvent } from "../helpers/event";
-import {
-  CalendarObject,
-  ErrorObject,
-  EventObject,
-  ReminderObject,
-} from "../helpers/types";
+import { CalendarObject, ErrorObject, EventObject } from "../helpers/types";
 import { deleteAccount } from "../helpers/account";
 import {
   inviteCalendarMembers,
