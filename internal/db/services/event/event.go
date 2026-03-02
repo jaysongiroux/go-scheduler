@@ -1167,7 +1167,11 @@ func (q *Queries) GetInstanceByMasterAndOriginalStart(
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			logger.Error("failed to close rows: %v", closeErr)
+		}
+	}()
 	if !rows.Next() {
 		return nil, sql.ErrNoRows
 	}
