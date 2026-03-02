@@ -280,17 +280,24 @@ func (q *Queries) CreateEvent(ctx context.Context, event *Event) (Event, error) 
 	return createdEvent, nil
 }
 
-// GetEvent retrieves an event by ID
-// Note: Reminders are NOT included - use reminder repository to fetch them separately
+// GetEvent retrieves an event by ID.
+// For recurring instances the master's recurrence fields are returned via a
+// LEFT JOIN so no extra round-trip is needed.
+// Note: Reminders are NOT included - use reminder repository to fetch them separately.
 func (q *Queries) GetEvent(ctx context.Context, eventUID uuid.UUID, _ *bool) (*Event, error) {
 	query := `
 		SELECT 
-			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
-			created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts,
-			exdates_ts, is_recurring_instance, master_event_uid, original_start_ts,
-			is_modified, is_cancelled, metadata, timezone, local_start
-		FROM calendar_events
-		WHERE event_uid = $1
+			e.event_uid, e.calendar_uid, e.account_id, e.start_ts, e.duration, e.end_ts,
+			e.created_ts, e.updated_ts,
+			COALESCE(e.recurrence, m.recurrence),
+			COALESCE(e.recurrence_status, m.recurrence_status),
+			COALESCE(e.recurrence_end_ts, m.recurrence_end_ts),
+			e.exdates_ts, e.is_recurring_instance, e.master_event_uid, e.original_start_ts,
+			e.is_modified, e.is_cancelled, e.metadata, e.timezone, e.local_start
+		FROM calendar_events e
+		LEFT JOIN calendar_events m
+			ON e.is_recurring_instance = TRUE AND e.master_event_uid = m.event_uid
+		WHERE e.event_uid = $1
 	`
 
 	var evt Event
@@ -396,28 +403,33 @@ func (q *Queries) GetCalendarEvents(
 	endTsPlaceholder := fmt.Sprintf("$%d", len(calendarUIDs)+2)
 	args = append(args, startTs, endTs)
 
-	// Time range provided - get non-recurring events + instances in range
-	// Also fetch master events for potential on-demand expansion
+	// Fetch non-recurring events, pre-generated instances (with master recurrence
+	// via LEFT JOIN), and master events for on-demand expansion — all in one query.
 	query = fmt.Sprintf(`
 		SELECT 
-			event_uid, calendar_uid, account_id, start_ts, duration, end_ts,
-			created_ts, updated_ts, recurrence, recurrence_status, recurrence_end_ts,
-			exdates_ts, is_recurring_instance, master_event_uid, original_start_ts,
-			is_modified, is_cancelled, metadata, timezone, local_start
-		FROM calendar_events
-		WHERE calendar_uid IN (%s)
-		AND is_cancelled = FALSE
+			e.event_uid, e.calendar_uid, e.account_id, e.start_ts, e.duration, e.end_ts,
+			e.created_ts, e.updated_ts,
+			COALESCE(e.recurrence, m.recurrence),
+			COALESCE(e.recurrence_status, m.recurrence_status),
+			COALESCE(e.recurrence_end_ts, m.recurrence_end_ts),
+			e.exdates_ts, e.is_recurring_instance, e.master_event_uid, e.original_start_ts,
+			e.is_modified, e.is_cancelled, e.metadata, e.timezone, e.local_start
+		FROM calendar_events e
+		LEFT JOIN calendar_events m
+			ON e.is_recurring_instance = TRUE AND e.master_event_uid = m.event_uid
+		WHERE e.calendar_uid IN (%s)
+		AND e.is_cancelled = FALSE
 		AND (
 			-- Non-recurring events in time range
-			(recurrence IS NULL AND is_recurring_instance = FALSE AND end_ts >= %s AND start_ts <= %s)
+			(e.recurrence IS NULL AND e.is_recurring_instance = FALSE AND e.end_ts >= %s AND e.start_ts <= %s)
 			OR 
 			-- Pre-generated instances in time range
-			(is_recurring_instance = TRUE AND end_ts >= %s AND start_ts <= %s)
+			(e.is_recurring_instance = TRUE AND e.end_ts >= %s AND e.start_ts <= %s)
 			OR
 			-- Master events (for potential on-demand expansion beyond generation window)
-			(recurrence IS NOT NULL AND is_recurring_instance = FALSE)
+			(e.recurrence IS NOT NULL AND e.is_recurring_instance = FALSE)
 		)
-		ORDER BY start_ts ASC
+		ORDER BY e.start_ts ASC
 	`, strings.Join(placeholders, ","), startTsPlaceholder, endTsPlaceholder, startTsPlaceholder, endTsPlaceholder)
 
 	rows, err := q.pool.DB().QueryContext(ctx, query, args...)
@@ -652,11 +664,14 @@ func (q *Queries) expandRecurringEvent(
 			UpdatedTs:           event.UpdatedTs,
 			Timezone:            event.Timezone,
 			LocalStart:          localStart,
+			Recurrence:          event.Recurrence,
+			RecurrenceStatus:    event.RecurrenceStatus,
+			RecurrenceEndTs:     event.RecurrenceEndTs,
 			IsRecurringInstance: true,
 			MasterEventUID:      &event.EventUID,
 			OriginalStartTs:     &occTs,
 			Metadata:            event.Metadata,
-			Reminders:           []Reminder{}, // No reminders for virtual instances
+			Reminders:           []Reminder{},
 		}
 
 		instances = append(instances, instance)

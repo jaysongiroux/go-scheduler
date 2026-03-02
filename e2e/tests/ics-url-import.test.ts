@@ -118,7 +118,7 @@ describe("ICS URL Import API", () => {
       expect(response.calendar.account_id).toBe(accountId);
       expect(response.calendar.is_read_only).toBe(true);
       expect(response.calendar.ics_url).toBe(
-        `http://localhost:${port}/calendar.ics`
+        `http://localhost:${port}/calendar.ics`,
       );
       expect(response.calendar.ics_sync_interval_seconds).toBe(3600);
 
@@ -283,7 +283,7 @@ describe("ICS URL Import API", () => {
             ics_url: `http://localhost:${port}/calendar.ics`,
             auth_type: "none",
           }),
-        }
+        },
       );
 
       const response = (await httpResponse.json()) as ErrorObject;
@@ -430,7 +430,7 @@ describe("ICS URL Import API", () => {
             end_ts: Math.floor(Date.now() / 1000) + 7200,
             metadata: { title: "New Event" },
           }),
-        }
+        },
       );
 
       const errorResponse = (await createEventResponse.json()) as ErrorObject;
@@ -497,7 +497,7 @@ END:VCALENDAR`;
 
   test("Should store ETag from ICS server", async () => {
     const port = getNextPort();
-    const etag = '"abc123"';
+    const etag = '"your-secret-api-key-here"';
     const server = startICSServer(port, simpleICSContent, {
       etag: etag,
     });

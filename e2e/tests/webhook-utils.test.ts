@@ -407,29 +407,29 @@ describe("Webhook Utilities", () => {
   describe("extractSignature", () => {
     test("Should extract signature from x-webhook-signature header", () => {
       const headers = {
-        "x-webhook-signature": "sha256=abc123",
+        "x-webhook-signature": "sha256=your-secret-api-key-here",
       };
 
       const signature = WebhookUtils.extractSignature(headers);
-      expect(signature).toBe("sha256=abc123");
+      expect(signature).toBe("sha256=your-secret-api-key-here");
     });
 
     test("Should extract signature from X-Webhook-Signature header", () => {
       const headers = {
-        "X-Webhook-Signature": "sha256=abc123",
+        "X-Webhook-Signature": "sha256=your-secret-api-key-here",
       };
 
       const signature = WebhookUtils.extractSignature(headers);
-      expect(signature).toBe("sha256=abc123");
+      expect(signature).toBe("sha256=your-secret-api-key-here");
     });
 
     test("Should extract signature from x-signature header", () => {
       const headers = {
-        "x-signature": "sha256=abc123",
+        "x-signature": "sha256=your-secret-api-key-here",
       };
 
       const signature = WebhookUtils.extractSignature(headers);
-      expect(signature).toBe("sha256=abc123");
+      expect(signature).toBe("sha256=your-secret-api-key-here");
     });
 
     test("Should return null if no signature header", () => {
@@ -443,11 +443,14 @@ describe("Webhook Utilities", () => {
 
     test("Should handle array header values", () => {
       const headers = {
-        "x-webhook-signature": ["sha256=abc123", "sha256=def456"],
+        "x-webhook-signature": [
+          "sha256=your-secret-api-key-here",
+          "sha256=def456",
+        ],
       };
 
       const signature = WebhookUtils.extractSignature(headers);
-      expect(signature).toBe("sha256=abc123");
+      expect(signature).toBe("sha256=your-secret-api-key-here");
     });
   });
 

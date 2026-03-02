@@ -11,7 +11,7 @@ export default defineConfig({
     includeTaskLocation: true,
     env: {
       SCHEDULER_URL: "http://localhost:8080",
-      SCHEDULER_API_KEY: "abc123",
+      SCHEDULER_API_KEY: "your-secret-api-key-here",
     },
     coverage: {
       enabled: false,

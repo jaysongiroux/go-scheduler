@@ -417,6 +417,106 @@ describe("Recurring Event API - On-Demand Expansion", () => {
   });
 });
 
+describe("Recurring Instance Recurrence Info", () => {
+  let accountId: string = crypto.randomUUID();
+  let calendarUid: string;
+  let masterEventUid: string;
+  const recurrenceRule = "FREQ=DAILY;COUNT=5";
+
+  beforeAll(async () => {
+    const calendarResponse = (await createCalendar({
+      accountId: accountId,
+    })) as CalendarObject;
+    expect(calendarResponse.calendar_uid).toBeDefined();
+    calendarUid = calendarResponse.calendar_uid;
+
+    const now = Math.floor(Date.now() / 1000);
+    const response = (await createEvent({
+      calendarUid,
+      accountId,
+      startTs: now + 3600,
+      endTs: now + 7200,
+      recurrence: { rule: recurrenceRule },
+      metadata: { title: "Recurrence Info Test" },
+    })) as EventObject;
+    expect(response.event_uid).toBeDefined();
+    masterEventUid = response.event_uid;
+  });
+
+  test("List events: every instance includes recurrence from its master", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const getResponse = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 30,
+    })) as GenericPagedResponse<EventObject>;
+
+    expect(getResponse.count).toBe(5);
+    for (const event of getResponse.data) {
+      expect(event.is_recurring_instance).toBe(true);
+      expect(event.master_event_uid).toBe(masterEventUid);
+      expect(event.recurrence).toEqual({ rule: recurrenceRule });
+      expect(event.recurrence_status).toBeDefined();
+      expect(event.recurrence_status).not.toBeNull();
+    }
+  });
+
+  test("Get single instance by ID: includes recurrence from its master", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const listResponse = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 30,
+    })) as GenericPagedResponse<EventObject>;
+
+    const instance = listResponse.data[0];
+    expect(instance.is_recurring_instance).toBe(true);
+
+    const singleResponse = (await getEvent({
+      eventUid: instance.event_uid,
+    })) as EventObject;
+
+    expect(singleResponse.event_uid).toBe(instance.event_uid);
+    expect(singleResponse.is_recurring_instance).toBe(true);
+    expect(singleResponse.master_event_uid).toBe(masterEventUid);
+    expect(singleResponse.recurrence).toEqual({ rule: recurrenceRule });
+    expect(singleResponse.recurrence_status).toBeDefined();
+    expect(singleResponse.recurrence_status).not.toBeNull();
+  });
+
+  test("On-demand expanded instances include recurrence from master", async () => {
+    const onDemandCalResponse = (await createCalendar({
+      accountId,
+    })) as CalendarObject;
+    const onDemandCalUid = onDemandCalResponse.calendar_uid;
+
+    const now = Math.floor(Date.now() / 1000);
+    const response = (await createEvent({
+      calendarUid: onDemandCalUid,
+      accountId,
+      startTs: now + 3600,
+      endTs: now + 7200,
+      recurrence: { rule: "FREQ=WEEKLY" },
+      metadata: { title: "On-Demand Recurrence Info" },
+    })) as EventObject;
+
+    // Query far beyond the generation window so on-demand expansion is used
+    const farFuture = now + 86400 * 365 * 10;
+    const getResponse = (await getCalendarEvents({
+      calendarUids: onDemandCalUid,
+      startTs: farFuture,
+      endTs: farFuture + 86400 * 30,
+    })) as GenericPagedResponse<EventObject>;
+
+    expect(getResponse.count).toBeGreaterThan(0);
+    for (const event of getResponse.data) {
+      expect(event.is_recurring_instance).toBe(true);
+      expect(event.recurrence).toEqual({ rule: "FREQ=WEEKLY" });
+      expect(event.recurrence_status).toBe("active");
+    }
+  });
+});
+
 describe("Timezone Support API", () => {
   let accountId: string = crypto.randomUUID();
   let calendarUid: string;

@@ -14,9 +14,9 @@ env:
   POSTGRES_USER: postgres
   POSTGRES_PASSWORD: postgres
   DATABASE_URL: postgres://postgres:postgres@localhost:5432/go-scheduler?sslmode=disable
-  API_KEY: abc123
+  API_KEY: your-secret-api-key-here
   SCHEDULER_URL: http://localhost:8080
-  SCHEDULER_API_KEY: abc123
+  SCHEDULER_API_KEY: your-secret-api-key-here
   ICS_ENCRYPTION_KEY: abcdefghijklmnopqrstuvwxyz123456
 
 jobs:
