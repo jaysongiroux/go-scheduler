@@ -270,11 +270,10 @@ describe("Recurring Event API", () => {
     expect(getResponse.count).toBe(10);
     expect(getResponse.data).toHaveLength(10);
     expect(getResponse.data[0].calendar_uid).toBe(calendarUid);
-    // Create response returns the master; list returns only instances
+    // Create response returns the master; list returns only instances (recurrence is on master only)
     masterEventUid = response.event_uid;
     const firstInstance = getResponse.data[0];
     expect(firstInstance?.master_event_uid).toBe(masterEventUid);
-    expect(firstInstance?.recurrence).toEqual({ rule: "FREQ=DAILY;COUNT=10" });
     expect(firstInstance?.metadata).toEqual({ title: "Test Event" });
   });
 
