@@ -1069,6 +1069,18 @@ func (q *Queries) insertInstanceBatch(ctx context.Context, instances []*Event) e
 	return err
 }
 
+// DeleteAllInstances deletes every instance of a master event regardless of timestamp.
+// Used by scope "all" updates to wipe and regenerate the full series.
+func (q *Queries) DeleteAllInstances(ctx context.Context, masterUID uuid.UUID) error {
+	query := `
+		DELETE FROM calendar_events
+		WHERE master_event_uid = $1
+		AND is_recurring_instance = TRUE
+	`
+	_, err := q.pool.DB().ExecContext(ctx, query, masterUID)
+	return err
+}
+
 // DeleteFutureInstances deletes all instances of a master event after the given timestamp
 func (q *Queries) DeleteFutureInstances(
 	ctx context.Context,
@@ -1192,7 +1204,7 @@ func (q *Queries) InsertSingleInstance(ctx context.Context, inst *Event) error {
 			original_start_ts, is_modified, is_cancelled, exdates_ts, metadata,
 			timezone, local_start
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-		ON CONFLICT (master_event_uid, original_start_ts)
+		ON CONFLICT (master_event_uid, original_start_ts) WHERE is_recurring_instance = TRUE
 		DO UPDATE SET
 			start_ts = EXCLUDED.start_ts,
 			duration = EXCLUDED.duration,

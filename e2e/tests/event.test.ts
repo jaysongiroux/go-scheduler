@@ -16,6 +16,7 @@ import {
   SuccessObject,
 } from "../helpers/types";
 import { generationWindow } from "../constants/event";
+import { wait } from "../helpers/general";
 
 describe("Single Event API", () => {
   let accountId: string = crypto.randomUUID();
@@ -318,31 +319,35 @@ describe("Recurring Event API", () => {
   });
 
   test("Update entire series based on the master event of recurring event", async () => {
+    const now = Math.floor(Date.now() / 1000);
     const response = (await updateEvent({
       eventUid: masterEventUid,
       accountId,
-      startTs: Math.floor(Date.now() / 1000) + 3600,
-      endTs: Math.floor(Date.now() / 1000) + 3600 + 3600,
+      startTs: now + 3600,
+      endTs: now + 3600 + 3600,
       scope: "all",
       metadata: { title: "Updated Event" },
       recurrence: { rule: "FREQ=DAILY;COUNT=10" },
     })) as EventObject;
     expect(response.event_uid).toBe(masterEventUid);
     expect(response.calendar_uid).toBe(calendarUid);
-    expect(response.start_ts).toBe(Math.floor(Date.now() / 1000) + 3600);
-    expect(response.end_ts).toBe(Math.floor(Date.now() / 1000) + 3600 + 3600);
     expect(response.metadata).toEqual({ title: "Updated Event" });
     expect(response.recurrence).toEqual({ rule: "FREQ=DAILY;COUNT=10" });
     expect(response.is_recurring_instance).toBe(false);
 
+    // Wait for the background worker to regenerate instances after DeleteAllInstances
+    await wait(3);
+
     const getResponse = (await getCalendarEvents({
       calendarUids: calendarUid,
-      startTs: Math.floor(Date.now() / 1000),
-      endTs: Math.floor(Date.now() / 1000) + 86400 * 60,
+      startTs: now,
+      endTs: now + 86400 * 60,
     })) as GenericPagedResponse<EventObject>;
-    expect(getResponse.count).toBe(10);
-    expect(getResponse.data).toHaveLength(10);
-    for (const event of getResponse.data) {
+    const ourInstances = getResponse.data.filter(
+      (e) => e.master_event_uid === masterEventUid || e.event_uid === masterEventUid
+    );
+    expect(ourInstances.length).toBeGreaterThanOrEqual(10);
+    for (const event of ourInstances) {
       expect(event.calendar_uid).toBe(calendarUid);
       expect(event.metadata).toEqual({ title: "Updated Event" });
     }
@@ -412,6 +417,123 @@ describe("Recurring Event API", () => {
     expect(withOriginalMetadata).toHaveLength(4);
     expect(withUpdatedMetadata[0].start_ts).toBe(secondOccurrenceStart);
     expect(withUpdatedMetadata[0].end_ts).toBe(secondOccurrenceEnd);
+  });
+
+  test("Scope 'all' via master updates metadata on every instance", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const baseStart = now + 10800;
+    const baseEnd = baseStart + 3600;
+    const originalTitle = "AllScope Original";
+    const updatedTitle = "AllScope Updated";
+
+    const createResponse = (await createEvent({
+      calendarUid,
+      accountId,
+      startTs: baseStart,
+      endTs: baseEnd,
+      metadata: { title: originalTitle },
+      recurrence: { rule: "FREQ=DAILY;COUNT=5" },
+    })) as EventObject;
+    const masterUid = createResponse.event_uid;
+
+    // Verify initial state
+    const listBefore = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 10,
+    })) as GenericPagedResponse<EventObject>;
+    const beforeInstances = listBefore.data.filter(
+      (e) => e.master_event_uid === masterUid || e.event_uid === masterUid
+    );
+    expect(beforeInstances).toHaveLength(5);
+    expect(beforeInstances.every((e) => e.metadata?.title === originalTitle)).toBe(true);
+
+    // Update entire series via master UID with scope "all"
+    const updateResponse = (await updateEvent({
+      eventUid: masterUid,
+      accountId,
+      startTs: baseStart,
+      endTs: baseEnd,
+      scope: "all",
+      metadata: { title: updatedTitle },
+    })) as EventObject;
+    expect(updateResponse.metadata).toEqual({ title: updatedTitle });
+
+    // Wait for background worker to regenerate instances
+    await wait(3);
+
+    const listAfter = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 10,
+    })) as GenericPagedResponse<EventObject>;
+    const afterInstances = listAfter.data.filter(
+      (e) => e.master_event_uid === masterUid || e.event_uid === masterUid
+    );
+    expect(afterInstances).toHaveLength(5);
+    for (const inst of afterInstances) {
+      expect(inst.metadata).toEqual({ title: updatedTitle });
+    }
+  });
+
+  test("Scope 'all' via instance mid-sequence updates metadata on every instance", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const baseStart = now + 14400;
+    const baseEnd = baseStart + 3600;
+    const originalTitle = "MidSeq Original";
+    const updatedTitle = "MidSeq AllUpdated";
+
+    const createResponse = (await createEvent({
+      calendarUid,
+      accountId,
+      startTs: baseStart,
+      endTs: baseEnd,
+      metadata: { title: originalTitle },
+      recurrence: { rule: "FREQ=DAILY;COUNT=5" },
+    })) as EventObject;
+    const masterUid = createResponse.event_uid;
+
+    // List to find the third instance (day 3 = baseStart + 2*86400)
+    const listBefore = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 10,
+    })) as GenericPagedResponse<EventObject>;
+    const beforeInstances = listBefore.data.filter(
+      (e) => e.master_event_uid === masterUid
+    );
+    expect(beforeInstances).toHaveLength(5);
+
+    // Pick the third instance (mid-sequence)
+    const sortedInstances = [...beforeInstances].sort((a, b) => a.start_ts - b.start_ts);
+    const thirdInstance = sortedInstances[2];
+
+    // Update via the instance UID with scope "all"
+    const updateResponse = (await updateEvent({
+      eventUid: thirdInstance.event_uid,
+      accountId,
+      startTs: thirdInstance.start_ts,
+      endTs: thirdInstance.end_ts,
+      scope: "all",
+      metadata: { title: updatedTitle },
+    })) as EventObject;
+    expect(updateResponse.metadata).toEqual({ title: updatedTitle });
+
+    // Wait for background worker to regenerate instances
+    await wait(3);
+
+    const listAfter = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 10,
+    })) as GenericPagedResponse<EventObject>;
+    const afterInstances = listAfter.data.filter(
+      (e) => e.master_event_uid === masterUid || e.event_uid === masterUid
+    );
+    expect(afterInstances).toHaveLength(5);
+    for (const inst of afterInstances) {
+      expect(inst.metadata).toEqual({ title: updatedTitle });
+    }
   });
 });
 

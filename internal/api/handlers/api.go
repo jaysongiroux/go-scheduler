@@ -75,6 +75,7 @@ type EventRepository interface {
 		evt *event.Event,
 		window event.GenerationWindow,
 	) (*event.Event, []*event.Event, error)
+	DeleteAllInstances(ctx context.Context, masterUID uuid.UUID) error
 	DeleteFutureInstances(ctx context.Context, masterUID uuid.UUID, afterTs int64) error
 	GetFutureInstances(
 		ctx context.Context,

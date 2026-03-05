@@ -17,13 +17,19 @@ func RespondJSON(w http.ResponseWriter, status int, data interface{}) {
 }
 
 func RespondError(w http.ResponseWriter, status int, message string, details ...string) {
-	resp := map[string]interface{}{
-		"error": message,
-	}
+	detailStr := message
 	if len(details) > 0 {
-		resp["details"] = strings.Join(details, "\n")
-	} else {
-		resp["details"] = message
+		detailStr = strings.Join(details, "\n")
+	}
+	// Surface API errors in logs: 4xx as warning, 5xx as error
+	if status >= 500 {
+		logger.Error("API error [%d]: %s — %s", status, message, detailStr)
+	} else if status >= 400 {
+		logger.Warn("API error [%d]: %s — %s", status, message, detailStr)
+	}
+	resp := map[string]interface{}{
+		"error":   message,
+		"details": detailStr,
 	}
 	RespondJSON(w, status, resp)
 }
