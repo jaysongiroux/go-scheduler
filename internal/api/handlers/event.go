@@ -358,6 +358,13 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		web.RespondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
+	var rawBody map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &rawBody); err != nil {
+		web.RespondError(w, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	_, timezoneProvided := rawBody["timezone"]
+	_, localStartProvided := rawBody["local_start"]
 
 	// Validate and process timezone/local_start if provided
 	if errMsg := validateAndProcessTimezone(&updateData); errMsg != "" {
@@ -606,10 +613,12 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 			if updateData.Recurrence != nil {
 				master.Recurrence = updateData.Recurrence
 			}
-			if updateData.Timezone != nil {
+			if timezoneProvided && updateData.Timezone != nil {
 				master.Timezone = updateData.Timezone
 			}
-			if updateData.LocalStart != nil {
+			// For scope=all, only update local_start when explicitly provided.
+			// This avoids re-anchoring the series to the edited instance start_ts.
+			if localStartProvided && updateData.LocalStart != nil {
 				master.LocalStart = updateData.LocalStart
 			}
 
@@ -623,14 +632,20 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Delete ALL instances (past and future) so the worker regenerates them
-			// with the updated master metadata
-			if err := h.EventRepo.DeleteAllInstances(r.Context(), master.EventUID); err != nil {
-				logger.Error("Failed to delete instances: %v", err)
+			// Keep existing instances and apply the new series-level fields in place.
+			// This preserves past occurrences when updating from a mid-sequence instance.
+			if err := h.EventRepo.UpdateAllInstances(
+				r.Context(),
+				master.EventUID,
+				master.Metadata,
+				master.Timezone,
+				master.LocalStart,
+			); err != nil {
+				logger.Error("Failed to update instances: %v", err)
 				web.RespondError(
 					w,
 					http.StatusInternalServerError,
-					"Failed to delete instances",
+					"Failed to update instances",
 					err.Error(),
 				)
 				return
@@ -753,10 +768,12 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 			if updateData.Recurrence != nil {
 				existingEvent.Recurrence = updateData.Recurrence
 			}
-			if updateData.Timezone != nil {
+			if timezoneProvided && updateData.Timezone != nil {
 				existingEvent.Timezone = updateData.Timezone
 			}
-			if updateData.LocalStart != nil {
+			// For scope=all, only update local_start when explicitly provided.
+			// This avoids re-anchoring the series to the edited instance start_ts.
+			if localStartProvided && updateData.LocalStart != nil {
 				existingEvent.LocalStart = updateData.LocalStart
 			}
 
@@ -770,14 +787,20 @@ func (h *Handler) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Delete ALL instances (past and future) so the worker regenerates them
-			// with the updated master metadata
-			if err := h.EventRepo.DeleteAllInstances(r.Context(), existingEvent.EventUID); err != nil {
-				logger.Error("Failed to delete instances: %v", err)
+			// Keep existing instances and apply the new series-level fields in place.
+			// This preserves past occurrences when updating from a mid-sequence instance.
+			if err := h.EventRepo.UpdateAllInstances(
+				r.Context(),
+				existingEvent.EventUID,
+				existingEvent.Metadata,
+				existingEvent.Timezone,
+				existingEvent.LocalStart,
+			); err != nil {
+				logger.Error("Failed to update instances: %v", err)
 				web.RespondError(
 					w,
 					http.StatusInternalServerError,
-					"Failed to delete instances",
+					"Failed to update instances",
 					err.Error(),
 				)
 				return

@@ -117,6 +117,17 @@ describe("SDK Client Integration Tests", () => {
     let eventUid: string;
 
     beforeAll(async () => {
+      // Ensure an event calendar exists for this suite (don't rely on test order).
+      if (!calendarUid1) {
+        const cal1 = await client.calendars.create({
+          account_id: accountId1,
+          metadata: {
+            name: "SDK Event Ops Calendar",
+          },
+        });
+        calendarUid1 = cal1.calendar_uid;
+      }
+
       // Create a second calendar for transfer tests
       const cal2 = await client.calendars.create({
         account_id: accountId2,
@@ -206,6 +217,103 @@ describe("SDK Client Integration Tests", () => {
 
       // Cleanup
       await client.events.delete(recurring.event_uid, accountId1, "all");
+    });
+
+    test("should preserve earlier instances when updating scope=all from a middle instance", async () => {
+      const now = Math.floor(Date.now() / 1000);
+      // Start in the past so there are true "earlier" occurrences before the edited one.
+      const baseStart = now - 86400 * 2 + 3600;
+      const baseEnd = baseStart + 3600;
+      const updatedTitle = "SDK Mid Sequence Scope All";
+
+      const recurring = await client.events.create({
+        calendar_uid: calendarUid1,
+        account_id: accountId1,
+        start_ts: baseStart,
+        end_ts: baseEnd,
+        recurrence: {
+          rule: "FREQ=DAILY;COUNT=5",
+        },
+        metadata: {
+          title: "SDK Original Series",
+        },
+      });
+
+      const masterUid = recurring.event_uid;
+
+      try {
+        const before = await client.events.getCalendarEvents({
+          calendar_uids: [calendarUid1],
+          start_ts: now - 86400 * 4,
+          end_ts: now + 86400 * 10,
+        });
+
+        const seriesBefore = before.data.filter(
+          (e) => e.master_event_uid === masterUid,
+        );
+        expect(seriesBefore.length).toBe(5);
+
+        const instanceBefore = seriesBefore.sort(
+          (a, b) => a.start_ts - b.start_ts,
+        );
+        expect(instanceBefore.length).toBe(5);
+
+        // Edit the true middle occurrence in the sequence (3rd of 5).
+        const middleIndex = 2;
+        const middleInstance = instanceBefore[middleIndex];
+        const priorStarts = instanceBefore
+          .slice(0, middleIndex)
+          .map((e) => e.start_ts)
+          .sort((a, b) => a - b);
+        expect(priorStarts.length).toBe(2);
+
+        expect(middleInstance).toBeDefined();
+        if (!middleInstance) {
+          throw new Error("Expected a middle recurring instance for update");
+        }
+
+        await client.events.update(middleInstance.event_uid, {
+          account_id: accountId1,
+          start_ts: middleInstance.start_ts,
+          end_ts: middleInstance.end_ts,
+          scope: "all",
+          metadata: {
+            title: updatedTitle,
+          },
+        });
+
+        const after = await client.events.getCalendarEvents({
+          calendar_uids: [calendarUid1],
+          start_ts: now - 86400 * 4,
+          end_ts: now + 86400 * 10,
+        });
+
+        const seriesAfter = after.data.filter(
+          (e) => e.master_event_uid === masterUid,
+        );
+        expect(seriesAfter.length).toBe(5);
+        for (const evt of seriesAfter) {
+          expect(evt.metadata?.title).toBe(updatedTitle);
+        }
+
+        const expectedStarts = Array.from(
+          { length: 5 },
+          (_, i) => baseStart + i * 86400,
+        );
+        const actualStarts = seriesAfter
+          .map((e) => e.start_ts)
+          .sort((a, b) => a - b);
+        expect(actualStarts).toEqual(expectedStarts);
+
+        // Core regression assertion: occurrences before the edited middle event must survive.
+        const priorStartsAfter = seriesAfter
+          .map((e) => e.start_ts)
+          .filter((ts) => ts < middleInstance.start_ts)
+          .sort((a, b) => a - b);
+        expect(priorStartsAfter).toEqual(priorStarts);
+      } finally {
+        await client.events.delete(masterUid, accountId1, "all");
+      }
     });
 
     test("should delete an event", async () => {

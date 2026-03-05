@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -75,6 +76,13 @@ type EventRepository interface {
 		evt *event.Event,
 		window event.GenerationWindow,
 	) (*event.Event, []*event.Event, error)
+	UpdateAllInstances(
+		ctx context.Context,
+		masterUID uuid.UUID,
+		metadata json.RawMessage,
+		timezone *string,
+		localStart *string,
+	) error
 	DeleteAllInstances(ctx context.Context, masterUID uuid.UUID) error
 	DeleteFutureInstances(ctx context.Context, masterUID uuid.UUID, afterTs int64) error
 	GetFutureInstances(

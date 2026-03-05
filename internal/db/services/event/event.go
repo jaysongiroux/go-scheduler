@@ -443,8 +443,8 @@ func (q *Queries) GetCalendarEvents(
 	}()
 
 	allEvents := make([]*Event, 0)
-	masterEvents := make(map[uuid.UUID]*Event)                      // master UID -> master event
-	masterInstances := make(map[uuid.UUID][]*Event)                 // master UID -> instance rows from DB
+	masterEvents := make(map[uuid.UUID]*Event)      // master UID -> master event
+	masterInstances := make(map[uuid.UUID][]*Event) // master UID -> instance rows from DB
 
 	for rows.Next() {
 		evt, err := q.scanEventFromRows(rows)
@@ -1086,6 +1086,39 @@ func (q *Queries) DeleteAllInstances(ctx context.Context, masterUID uuid.UUID) e
 		AND is_recurring_instance = TRUE
 	`
 	_, err := q.pool.DB().ExecContext(ctx, query, masterUID)
+	return err
+}
+
+// UpdateAllInstances overwrites metadata/timezone/local_start on every instance in a series.
+// Used by scope "all" updates so existing past and future instances are preserved.
+func (q *Queries) UpdateAllInstances(
+	ctx context.Context,
+	masterUID uuid.UUID,
+	metadata json.RawMessage,
+	timezone *string,
+	localStart *string,
+) error {
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+
+	query := `
+		UPDATE calendar_events
+		SET metadata = $2,
+		    timezone = $3,
+		    local_start = $4,
+		    updated_ts = EXTRACT(EPOCH FROM NOW())::BIGINT
+		WHERE master_event_uid = $1
+		AND is_recurring_instance = TRUE
+	`
+	_, err := q.pool.DB().ExecContext(
+		ctx,
+		query,
+		masterUID,
+		metadata,
+		db.ToNullableString(timezone),
+		db.ToNullableString(localStart),
+	)
 	return err
 }
 

@@ -534,6 +534,80 @@ describe("Recurring Event API", () => {
     for (const inst of afterInstances) {
       expect(inst.metadata).toEqual({ title: updatedTitle });
     }
+
+    // Regression check: updating via a mid-sequence instance must not re-anchor
+    // the series and drop earlier occurrences.
+    const expectedStarts = Array.from({ length: 5 }, (_, i) => baseStart + i * 86400);
+    const actualStarts = afterInstances.map((e) => e.start_ts).sort((a, b) => a - b);
+    expect(actualStarts).toEqual(expectedStarts);
+  });
+
+  test("Scope 'all' via mid-sequence instance with timezone does not re-anchor series", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const baseStart = now + 14400;
+    const baseEnd = baseStart + 3600;
+    const originalTitle = "MidSeq TZ Original";
+    const updatedTitle = "MidSeq TZ AllUpdated";
+
+    const createResponse = (await createEvent({
+      calendarUid,
+      accountId,
+      startTs: baseStart,
+      endTs: baseEnd,
+      timezone: "America/New_York",
+      metadata: { title: originalTitle },
+      recurrence: { rule: "FREQ=DAILY;COUNT=5" },
+    })) as EventObject;
+    const masterUid = createResponse.event_uid;
+
+    const listBefore = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 10,
+    })) as GenericPagedResponse<EventObject>;
+    const beforeInstances = listBefore.data
+      .filter((e) => e.master_event_uid === masterUid)
+      .sort((a, b) => a.start_ts - b.start_ts);
+    expect(beforeInstances).toHaveLength(5);
+    const beforeStarts = beforeInstances.map((e) => e.start_ts);
+
+    // Pick a middle occurrence and update using scope=all with timezone provided.
+    const thirdInstance = beforeInstances[2];
+    expect(thirdInstance).toBeDefined();
+    if (!thirdInstance) {
+      throw new Error("Expected third recurring instance");
+    }
+    const updateResponse = (await updateEvent({
+      eventUid: thirdInstance.event_uid,
+      accountId,
+      startTs: thirdInstance.start_ts,
+      endTs: thirdInstance.end_ts,
+      scope: "all",
+      timezone: "America/New_York",
+      metadata: { title: updatedTitle },
+    })) as EventObject;
+    expect(updateResponse.metadata).toEqual({ title: updatedTitle });
+
+    await wait(3);
+
+    const listAfter = (await getCalendarEvents({
+      calendarUids: calendarUid,
+      startTs: now,
+      endTs: now + 86400 * 10,
+    })) as GenericPagedResponse<EventObject>;
+    const afterInstances = listAfter.data
+      .filter((e) => e.master_event_uid === masterUid || e.event_uid === masterUid)
+      .sort((a, b) => a.start_ts - b.start_ts);
+    expect(afterInstances).toHaveLength(5);
+    for (const inst of afterInstances) {
+      expect(inst.metadata).toEqual({ title: updatedTitle });
+    }
+
+    // Regression check: sending timezone on scope=all must not re-anchor/truncate
+    // the series. Compare against actual pre-update occurrence timestamps so this
+    // remains valid across DST transitions.
+    const actualStarts = afterInstances.map((e) => e.start_ts);
+    expect(actualStarts).toEqual(beforeStarts);
   });
 });
 
