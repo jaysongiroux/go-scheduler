@@ -639,6 +639,9 @@ func (q *Queries) expandRecurringEvent(
 		exDateMap[ex] = true
 	}
 
+	// Master's local time-of-day (HH:MM:SS) for DST-aware same local time every occurrence
+	dtstartClock := opt.Dtstart.Format("15:04:05")
+
 	instances := make([]*Event, 0, len(occurrences))
 	for _, occ := range occurrences {
 		// Convert occurrence to UTC for storage
@@ -649,10 +652,11 @@ func (q *Queries) expandRecurringEvent(
 			continue
 		}
 
-		// Compute local_start for this occurrence (format in event TZ for DST consistency)
+		// Compute local_start: occurrence date in event TZ + master's local time (DST-consistent)
 		var localStart *string
 		if event.Timezone != nil && *event.Timezone != "" {
-			ls := occ.In(loc).Format("2006-01-02T15:04:05")
+			datePart := occ.In(loc).Format("2006-01-02")
+			ls := datePart + "T" + dtstartClock
 			localStart = &ls
 		}
 
@@ -939,6 +943,9 @@ func (q *Queries) generateInstances(master *Event, startTs, endTs int64) []*Even
 		exDateMap[ex] = true
 	}
 
+	// Master's local time-of-day (HH:MM:SS) for DST-aware same local time every occurrence
+	dtstartClock := opt.Dtstart.Format("15:04:05")
+
 	now := time.Now().UTC().Unix()
 	instances := make([]*Event, 0, len(occurrences))
 
@@ -951,10 +958,11 @@ func (q *Queries) generateInstances(master *Event, startTs, endTs int64) []*Even
 			continue
 		}
 
-		// Compute local_start for this occurrence (format in event TZ for DST consistency)
+		// Compute local_start: occurrence date in event TZ + master's local time (DST-consistent)
 		var localStart *string
 		if master.Timezone != nil && *master.Timezone != "" {
-			ls := occ.In(loc).Format("2006-01-02T15:04:05")
+			datePart := occ.In(loc).Format("2006-01-02")
+			ls := datePart + "T" + dtstartClock
 			localStart = &ls
 		}
 
